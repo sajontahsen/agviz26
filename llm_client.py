@@ -17,9 +17,31 @@ from typing import Any
 from openai import OpenAI
 
 
+def _usage_dict(usage: Any) -> dict[str, Any]:
+    """Normalize a provider usage object into a plain dict (best effort).
+
+    Different backends expose token counts differently (or not at all); we
+    only need input/output/total so the pipeline can meter the 1M budget.
+    """
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        raw = usage
+    elif hasattr(usage, "model_dump"):
+        raw = usage.model_dump()
+    else:
+        raw = {k: getattr(usage, k) for k in dir(usage) if not k.startswith("_") and isinstance(getattr(usage, k, None), int)}
+    prompt = raw.get("prompt_tokens") or raw.get("input_tokens") or 0
+    completion = raw.get("completion_tokens") or raw.get("output_tokens") or 0
+    total = raw.get("total_tokens") or (prompt + completion)
+    return {"input_tokens": prompt, "output_tokens": completion, "total_tokens": total}
+
+
 class OpenAIChatClient:
     def __init__(self) -> None:
         self.client = OpenAI()
+        # Populated after each create() so callers can meter token spend.
+        self.last_usage: dict[str, Any] = {}
 
     def create(
         self,
@@ -28,13 +50,18 @@ class OpenAIChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         tool_choice: str | dict[str, Any] | None,
+        max_tokens: int = 8192,
     ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": 8192}
+        # gpt-5 / o-series reasoning models reject `max_tokens` and require
+        # `max_completion_tokens`; classic chat models take `max_tokens`.
+        token_param = "max_completion_tokens" if model.startswith(("gpt-5", "o1", "o3", "o4")) else "max_tokens"
+        kwargs: dict[str, Any] = {"model": model, "messages": messages, token_param: max_tokens}
         if tools:
             kwargs["tools"] = tools
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
         response = self.client.chat.completions.create(**kwargs)
+        self.last_usage = _usage_dict(getattr(response, "usage", None))
         return response.choices[0].message.model_dump(exclude_none=True)
 
 
@@ -51,6 +78,8 @@ class ArenaChatClient:
             # tool call that writes the final HTML artifact.
             timeout=600.0,
         )
+        # Populated after each create() so callers can meter token spend.
+        self.last_usage: dict[str, Any] = {}
 
     def create(
         self,
@@ -59,6 +88,7 @@ class ArenaChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         tool_choice: str | dict[str, Any] | None,
+        max_tokens: int = 8192,
     ) -> dict[str, Any]:
         response = self.client.create_llm_message(
             job_id=self.job_id,
@@ -67,8 +97,9 @@ class ArenaChatClient:
             tool_choice=tool_choice,
             model=model,
             purpose=self.purpose,
-            max_tokens=8192,
+            max_tokens=max_tokens,
         )
+        self.last_usage = _usage_dict(getattr(response, "usage", None))
         return response.message
 
 

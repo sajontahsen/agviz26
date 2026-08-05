@@ -36,8 +36,8 @@ from llm_client import make_llm_client
 #   haiku-4-5 (cheapest), sonnet-4-5 (balanced), opus-4-8/4-7 (priciest),
 #   deepseek.v3.2, moonshotai.kimi-k2.5 (open models, tool-use capable).
 # Call wrappers live in llm_client.py.
-CLOUD_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-LOCAL_MODEL = "gpt-5.5"
+CLOUD_MODEL = "global.anthropic.claude-opus-4-8"
+LOCAL_MODEL = "gpt-5-nano"
 # Cloud jobs set VIS_ARENA_JOB_ID; local runs don't.
 DEFAULT_MODEL = CLOUD_MODEL if os.environ.get("VIS_ARENA_JOB_ID") else LOCAL_MODEL
 
@@ -139,12 +139,10 @@ def models() -> dict[str, Any]:
 
 
 def generate(workdir: Path) -> dict[str, Any]:
-    return _run_tool_loop(
-        GENERATION_PROMPT,
-        f"WORKDIR={workdir}",
-        tool_root=workdir,
-        purpose="generation",
-    )
+    # Staged pipeline: profile -> planner -> analyst -> coder (see pipeline/stages.py).
+    from pipeline.stages import orchestrate
+
+    return orchestrate(workdir)
 
 
 def evaluate(workdir: Path, artifact_url: str) -> dict[str, Any]:
