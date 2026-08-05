@@ -25,8 +25,13 @@ from typing import Any
 
 from llm_client import make_llm_client
 
-from .runner import StageResult, run_stage
+from .runner import BudgetTracker, StageResult, run_stage
 from .tools import ToolContext
+
+# Cap total generation spend so the shared per-job budget (~1M on cloud) always
+# leaves room for the evaluation phase. Generation and evaluation share one
+# budget; overrunning here 429s the evaluator.
+GEN_TOKEN_CEILING = 650_000
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +173,8 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
     ]
 
-    results = [_safe_run(ctx=ctx, client=client, **spec) for spec in specs]
+    budget = BudgetTracker(ceiling=GEN_TOKEN_CEILING)
+    results = [_safe_run(ctx=ctx, client=client, budget=budget, **spec) for spec in specs]
 
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
@@ -202,7 +208,8 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
     dist_ready = (workdir / "dist" / "index.html").exists()
     # Compact per-stage line, embedded in notes so it persists via generation.json.
     per_stage = " ".join(f"{s['stage']}={s['total_tokens']}({'ok' if s['finished'] else 'unfinished'})" for s in stages_meta)
-    notes = f"staged pipeline (profile->planner->analyst->coder); tokens total={total} [{per_stage}]; dist_ready={dist_ready}"
+    notes = (f"staged pipeline (profile->planner->analyst->coder); tokens total={total}/{GEN_TOKEN_CEILING} "
+             f"[{per_stage}]; dist_ready={dist_ready}")
 
     print("[pipeline] token spend by stage:", file=sys.stderr)
     for s in stages_meta:
