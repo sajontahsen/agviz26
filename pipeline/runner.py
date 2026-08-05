@@ -83,7 +83,7 @@ def run_stage(
     client: Any,
     purpose: str = "generation",
     max_steps: int = 24,
-    prune_keep: int = 4,
+    prune_keep: int = 10,
     max_tokens: int = 8192,
     budget: BudgetTracker | None = None,
     low_water: int = 60_000,

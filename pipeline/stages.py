@@ -43,10 +43,10 @@ CLOUD_OPUS = "global.anthropic.claude-opus-4-8"
 LOCAL_MODEL = os.environ.get("VIS_ARENA_LOCAL_MODEL", "gpt-5-nano")
 
 _CLOUD_ROLES = {
-    "profile": CLOUD_SONNET,
+    "profile": CLOUD_OPUS,
     "planner": CLOUD_OPUS,
     "analyst": CLOUD_OPUS,
-    "coder": CLOUD_SONNET,
+    "coder": CLOUD_OPUS,
 }
 
 
@@ -101,36 +101,45 @@ Inputs: task.md, profile.json, and questions.json (read all three). Raw data is 
 Workflow:
 1. Read questions.json and profile.json.
 2. Write source/analyze.py that loads data/ and computes an answer for EACH question id. Run it with bash; iterate until clean.
-3. Emit findings.json (at the workdir root): {"findings": [ {id, answer, values, method, caveats} ... ]} where
+3. Emit findings.json (at the workdir root): {"findings": [ {id, answer, data_profile, method, caveats} ... ]} where
+   - id: Must exactly match the id from questions.json
    - answer: concise plain-language answer
-   - values: the supporting numbers as a SMALL, plot-ready structure (e.g. a series of {x,y}, a top-N ranking, a small table). Keep it compact — top-N and aggregates only, never raw dumps.
+   - data_profile: A schema definition containing:
+        - "filepath": Local path where analyze.py saved the dataset (e.g., "outputs/<id>.csv" or "outputs/<id>.json"). Choose the best format for the data shape.
+        - "format": "csv" or "json"
+        - "schema": For tabular data, map columns to types. For graphs/nested data, describe the structure.
+        - "sample": A minimal snippet (e.g., 2 rows, or 1 node/edge) showing exact structure.
    - method: one line on how it was computed
    - caveats: any data limitations (optional)
 4. Call finish.
 
-Keep findings.json well under ~100KB. If a result would be huge, aggregate or cap to top-N."""
+CRITICAL INSTRUCTION: Your analyze.py script MUST save the calculated, plot-ready data to separate files in an `outputs/` directory. NEVER inline full data arrays into findings.json. The `data_profile` must be generated programmatically by analyze.py to guarantee accuracy. Do not copy the original questions or rationales into findings.json; the system will merge those later."""
 
 CODER_SYSTEM = """You are a web data-visualization engineer. Build ONE cohesive, self-contained, interactive artifact at dist/index.html that tells a clear story and lets a reviewer inspect the answers to the task.
 
-Inputs: task.md (what was asked) and findings.json (VERIFIED facts — display these; do not invent or alter numbers). profile.json is available for structure. Raw data is in data/ if you need finer aggregates for a chart.
+Read these (workdir root):
+- task.md — what was asked.
+- viz_context.json — the visualizations to build, under "visualizations_to_build". Each item has: id, question, rationale, expected_form, answer, method, caveats, and a `data_profile` = {filepath, format, schema, sample}. The `data_profile` tells you where the plot-ready data lives and its exact structure. Use the exact fields shown in `schema`/`sample` — never rename or invent keys (mismatched keys silently break charts).
 
-How to build (this avoids the per-message output-token limit):
-- Write source/build.py that (a) reads findings.json (and data/ if needed), (b) computes compact plot-ready aggregates, (c) writes dist/index.html with the data EMBEDDED as inline JSON. Run it with bash. Build the HTML in the script; use str_replace for edits rather than re-emitting whole files.
-- Rendering libraries (pin these exact versions, load from CDN):
-    Plotly.js  -> https://cdn.plot.ly/plotly-2.35.2.min.js   (statistical/comparative charts)
-    Cytoscape.js -> https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js   (network/graph panels)
-  Use Plotly for most charts; use Cytoscape only for network/graph views. Never render tens of thousands of nodes raw — show ego-graphs / aggregates.
-- The page MUST render from dist/index.html with no dev server (data inline; only the two CDN libs are external).
+Build:
+- Write source/build.py that reads each finding's data from its data_profile.filepath (relative to the workdir), embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
+- One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
+- Rendering libraries (pin these exact versions; load from CDN):
+ Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
+ Cytoscape.js https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js
+Plotly for statistical/comparative charts, Cytoscape only for network/graph findings. Never render tens of thousands of nodes raw.
+- The page must render from dist/index.html with no dev server;
+- Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast.
 
-Quality bar (you are judged on these):
-- data_fidelity: numbers on screen match findings.json.
-- insightfulness: call out trends, exceptions, comparisons — not just raw charts.
-- narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
-- visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
-- functionality: interactions (filters, tooltips, selection) actually work.
+You are judged on: data_fidelity (numbers match the findings), insightfulness (call out trends/exceptions/comparisons), narrative_coherence (hook->build->payoff, consistent encodings), visual_craft (right chart types, clear titles/axes/labels, disclosed scope), functionality (working interactions).
 
-Before finishing you MUST call verify (it renders dist/ and returns console errors + a screenshot). Fix any console/page errors and re-verify until clean. Then call finish with a short summary of the panels you built."""
-
+Validation Loop:
+When the page is written, you MUST call the `verify` tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
+If `verify` reports ANY `console_errors` or `page_errors`:
+1. Use `str_replace` or rewrite to fix the bug in build.py/HTML.
+2. Re-run `build.py` via bash to generate the new dist/index.html.
+3. Call `verify` again.
+Iterate until `verify` passes with 0 errors and non-empty charts. Then call finish with a short summary of the panels."""
 
 # ---------------------------------------------------------------------------
 # Orchestration
@@ -167,14 +176,19 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
         dict(
             name="coder", system_prompt=CODER_SYSTEM,
-            user_prompt=f"WORKDIR={wd}\nRead task.md and findings.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
+            user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=50, prune_keep=6,
+            model=pick_model("coder"), max_steps=50,
         ),
     ]
 
     budget = BudgetTracker(ceiling=GEN_TOKEN_CEILING)
-    results = [_safe_run(ctx=ctx, client=client, budget=budget, **spec) for spec in specs]
+    results: list[StageResult] = []
+    for spec in specs:
+        results.append(_safe_run(ctx=ctx, client=client, budget=budget, **spec))
+        if spec["name"] == "analyst":
+            # Deterministic join of questions x findings -> viz_context.json.
+            _safe_merge_context(workdir)
 
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
@@ -222,6 +236,43 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
         "stages": stages_meta,
         "dist_ready": dist_ready,
     }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic merge (post-analyst, no LLM): join questions x findings into
+# the coder's single input, with raw data left in the analyst's outputs/ files.
+# ---------------------------------------------------------------------------
+
+def _safe_merge_context(workdir: Path) -> None:
+    try:
+        _merge_context(workdir)
+    except Exception as exc:  # noqa: BLE001 - glue must not abort the run
+        print(f"[pipeline] merge_enriched_context skipped: {exc}", file=sys.stderr)
+
+
+def _merge_context(workdir: Path) -> None:
+    questions = json.loads((workdir / "questions.json").read_text(encoding="utf-8"))["questions"]
+    findings = json.loads((workdir / "findings.json").read_text(encoding="utf-8"))["findings"]
+    findings_dict = {f["id"]: f for f in findings if isinstance(f, dict) and f.get("id")}
+
+    enriched = []
+    for q in questions:
+        if not isinstance(q, dict) or not q.get("id"):
+            continue
+        finding = findings_dict.get(q["id"], {})
+        enriched.append({
+            "id": q["id"],
+            "question": q.get("question"),
+            "rationale": q.get("rationale"),
+            "expected_form": q.get("expected_form"),
+            "answer": finding.get("answer"),
+            "data_profile": finding.get("data_profile"),
+            "method": finding.get("method"),
+            "caveats": finding.get("caveats"),
+        })
+
+    (workdir / "viz_context.json").write_text(
+        json.dumps({"visualizations_to_build": enriched}, indent=2) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
