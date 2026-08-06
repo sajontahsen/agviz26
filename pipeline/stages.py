@@ -73,10 +73,10 @@ Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Ea
   - question: the analytical question in plain language
   - rationale: why it matters for the task and the story
   - computation_hint: concretely how to compute it from the data (which columns/edge-types/aggregation), grounded in profile.json field names
-  - expected_form: one of scalar | series | table | ranking | breakdown
+  - expected_form: one of scalar | series | table | ranking | breakdown | interactive_dashboard
   - supports: which task requirement or narrative beat it serves
 
-Aim for a focused set (roughly 6-12 questions) that together give the coder enough verified material for a complete, non-trivial story. Then call finish."""
+Aim for a strict bound of 5-6 questions. To balance deep statistical insights with broad token-efficient exploration, envision the final artifact as a unified dashboard. A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns), meaning 5 questions does NOT artificially limit the artifact to only 5 charts. Ensure all data views remain meaningful and purposeful. Then call finish."""
 
 ANALYST_SYSTEM = """You are a data ANALYST agent. Compute correct, verified answers to a set of questions directly from the raw dataset. These numbers become the ground truth the visualization displays, so correctness is paramount.
 
@@ -108,9 +108,11 @@ Read these (workdir root):
 Build:
 - Write source/build.py that reads each finding's data from its data_profile.filepath (relative to the workdir), embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
 - One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
+- For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
+- Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
 - Rendering libraries (pin these exact versions; load from CDN):
- Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
- Cytoscape.js https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js
+  Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
+  Cytoscape.js https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js
 Plotly for statistical/comparative charts, Cytoscape only for network/graph findings. Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
 - Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast.
