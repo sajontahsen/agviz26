@@ -18,11 +18,7 @@ from openai import OpenAI
 
 
 def _usage_dict(usage: Any) -> dict[str, Any]:
-    """Normalize a provider usage object into a plain dict (best effort).
-
-    Different backends expose token counts differently (or not at all); we
-    only need input/output/total so the pipeline can meter the 1M budget.
-    """
+    """Normalize a provider usage object into {input,output,total}_tokens (best effort across backends)."""
     if usage is None:
         return {}
     if isinstance(usage, dict):

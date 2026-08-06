@@ -1,18 +1,4 @@
-"""The v1 generation pipeline: profile -> planner -> analyst -> coder.
-
-Each stage is a short LLM session (see runner.run_stage) that reads compact
-files produced by earlier stages and writes one file forward:
-
-    profile   task.md + data/            -> profile.json     (data structure)
-    planner   task.md + profile.json     -> questions.json   (analytical asks)
-    analyst   + questions.json + data/    -> findings.json    (verified answers)
-    coder     task.md + findings.json     -> dist/index.html  (the artifact)
-
-Models are routed by role: on the cloud, Sonnet for mechanical stages and Opus
-for planning/analysis; locally everything uses LOCAL_MODEL (a cheap OpenAI model
-for smoke tests). The raw dataset is only ever touched by Python scripts the
-stages write and run — never slurped into the model context.
-"""
+"""Generation pipeline: profile -> planner -> analyst -> coder, each a short LLM stage passing files forward."""
 from __future__ import annotations
 
 import json
@@ -28,9 +14,7 @@ from llm_client import make_llm_client
 from .runner import BudgetTracker, StageResult, run_stage
 from .tools import ToolContext
 
-# Cap total generation spend so the shared per-job budget (~1M on cloud) always
-# leaves room for the evaluation phase. Generation and evaluation share one
-# budget; overrunning here 429s the evaluator.
+# Cap generation so the shared per-job budget (~1M cloud) leaves room for evaluation.
 GEN_TOKEN_CEILING = 650_000
 
 
@@ -151,10 +135,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     client = make_llm_client("generation")
     wd = str(workdir)
 
-    # Stage specs run in order. Each is isolated: a crash in one is caught and
-    # the pipeline continues best-effort (later stages degrade gracefully off
-    # whatever files exist). This matters because cloud jobs give us no stderr
-    # or traceback — an uncaught crash would surface only as an opaque "failed".
+    # Run in order; each stage is isolated so a crash doesn't abort the rest (cloud gives no traceback).
     specs = [
         dict(
             name="profile", system_prompt=PROFILE_SYSTEM,
@@ -207,13 +188,7 @@ def _safe_run(*, ctx: ToolContext, client: Any, name: str, **kwargs: Any) -> Sta
 
 
 def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
-    """Report generation telemetry to stderr and to the returned dict's
-    ``notes`` (which agent.py writes into generation.json). Note: in cloud the
-    authoritative token spend comes from the arena's usage API
-    (`vis-arena submissions usage <id>`), which already splits generation vs
-    evaluation per job; this per-stage breakdown is a local-dev aid. The
-    workspace is discarded after the job, so nothing is written for later reading.
-    """
+    """Log per-stage token telemetry to stderr and into the returned ``notes`` (goes to generation.json)."""
     total = sum(r.usage["total_tokens"] for r in results)
     stages_meta = [
         {"stage": r.name, "finished": r.finished, "steps": r.steps, **r.usage}
@@ -239,15 +214,14 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic merge (post-analyst, no LLM): join questions x findings into
-# the coder's single input, with raw data left in the analyst's outputs/ files.
+# Deterministic merge (post-analyst): join questions x findings -> viz_context.json.
 # ---------------------------------------------------------------------------
 
 def _safe_merge_context(workdir: Path) -> None:
     try:
         _merge_context(workdir)
     except Exception as exc:  # noqa: BLE001 - glue must not abort the run
-        print(f"[pipeline] merge_enriched_context skipped: {exc}", file=sys.stderr)
+        print(f"[pipeline] merge_context skipped: {exc}", file=sys.stderr)
 
 
 def _merge_context(workdir: Path) -> None:
@@ -301,10 +275,7 @@ _FALLBACK_TEMPLATE = """<!doctype html>
 
 
 def _ensure_fallback_dist(workdir: Path) -> None:
-    """Write a minimal, valid dist/index.html only if the pipeline produced none.
-
-    Must never raise. A tiny/empty file (truncated write) counts as "no artifact".
-    """
+    """Write a minimal findings-listing dist/index.html if the pipeline produced none (<=200 bytes counts as none). Never raises."""
     dist = workdir / "dist" / "index.html"
     try:
         if dist.exists() and dist.stat().st_size > 200:

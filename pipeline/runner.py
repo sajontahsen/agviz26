@@ -1,21 +1,4 @@
-"""Stage runner: one short, self-contained LLM session per pipeline stage.
-
-Each stage gets a fresh message list (system + user), a chosen subset of tools,
-and a model. History never crosses stage boundaries — stages hand work forward
-through *files* in the workdir, not through conversation. That is what keeps the
-multi-stage pipeline inside the token budget.
-
-Within a stage we prune aggressively: only the last few turns are kept verbatim.
-For older turns we elide BOTH the tool-result content AND the heavy payloads
-inside the assistant's tool-call arguments (the write_file/str_replace content a
-coder emits). Those payloads are the dominant cost — without eliding them, every
-KB the model writes re-enters the input context on every subsequent step and a
-long build loop balloons to ~1M tokens. The message *structure* (tool_calls and
-their ids) is preserved so the API stays happy; only large string values shrink.
-
-A shared BudgetTracker caps total generation spend across all stages so the job
-always leaves headroom for the evaluation phase (both share one per-job budget).
-"""
+"""Runs one LLM tool-loop per pipeline stage, with context pruning and a shared token budget."""
 from __future__ import annotations
 
 import json
@@ -52,12 +35,7 @@ class StageResult:
 
 @dataclass
 class BudgetTracker:
-    """Cumulative token ceiling shared across generation stages.
-
-    Generation and evaluation share one per-job budget (~1M on cloud). We cap
-    generation below that so evaluation always has room; without this, a hungry
-    coder loop can exhaust the whole budget and the eval phase 429s.
-    """
+    """Cumulative token ceiling shared across stages; caps generation so the shared per-job budget leaves room for evaluation."""
 
     ceiling: int
     spent: int = 0
@@ -170,14 +148,7 @@ def _accumulate(total: dict[str, int], last: dict[str, Any]) -> None:
 
 
 def _prune(messages: list[dict[str, Any]], keep: int) -> None:
-    """Shrink old turns in place, keeping the last `keep` tool turns verbatim.
-
-    For everything older than that window we elide two things: tool-result
-    content, and the heavy string payloads inside assistant tool-call arguments
-    (file/edit/script content). The assistant tool_calls structure and ids are
-    preserved so the API stays valid. Idempotent: already-elided values are short
-    and get skipped on re-runs.
-    """
+    """Elide tool results and assistant tool-call payloads older than the last `keep` tool turns, in place. Idempotent."""
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     if not keep or len(tool_idxs) <= keep:
         return  # nothing old enough to prune

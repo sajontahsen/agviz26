@@ -1,22 +1,6 @@
-"""Modern agent tool layer for the generation pipeline.
+"""Agent tools (schema + executor pairs) operating on the workdir via ToolContext.
 
-Each tool is a pair: an OpenAI-style function schema (advertised to the model)
-and an executor (runs the call). Tools operate relative to a ``tool_root``
-(the arena workdir) carried in a small ``ToolContext``.
-
-Design notes:
-  - ``write_file``/``str_replace`` let the model emit and edit files without
-    heredoc quoting or append-only token waste.
-  - ``read_file`` supports line-range reads so the model never has to slurp a
-    whole file into context.
-  - ``search`` prefers ripgrep and falls back to a pure-Python walk so it works
-    even where ``rg`` is absent.
-  - ``verify`` renders an artifact with Playwright and returns a *compact
-    summary* (console errors, title, text sample, screenshot path). The full
-    HTML never re-enters the model context — only this summary does.
-
-Keep executors total: return an error string rather than raising, so one bad
-tool call never crashes a whole stage.
+Executors return an error string rather than raising, so one bad call never crashes a stage.
 """
 from __future__ import annotations
 
@@ -48,12 +32,7 @@ class ToolContext:
         self.artifacts_dir = self.tool_root / ".artifacts"
 
     def resolve(self, path: str | None) -> Path:
-        """Resolve a possibly-relative path under tool_root.
-
-        Defensively strips a leading ``WORKDIR/`` (or bare ``WORKDIR``) that
-        models sometimes copy literally from prompts, so those writes land at
-        the workdir root instead of in a stray ``WORKDIR/`` subfolder.
-        """
+        """Resolve a path under tool_root, stripping a literal ``WORKDIR/`` prefix models sometimes copy from prompts."""
         if not path:
             return self.tool_root
         if path == "WORKDIR":
@@ -184,13 +163,7 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
 
 
 def verify(args: dict[str, Any], ctx: ToolContext) -> str:
-    """Render an artifact and return a compact health summary.
-
-    With no ``url`` it serves ``tool_root/dist`` on localhost (the generate
-    case). Optional ``actions`` is a list of Playwright-ish steps we run and
-    report on. Returns console errors, title, a text sample, and a saved
-    screenshot path. Degrades gracefully if Playwright is unavailable.
-    """
+    """Render an artifact (serving dist/ if no ``url``) and return a compact health summary: console errors, title, text, screenshot."""
     url = args.get("url")
     actions = args.get("actions") or []
     try:
