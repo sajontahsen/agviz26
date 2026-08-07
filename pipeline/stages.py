@@ -15,7 +15,7 @@ from .runner import BudgetTracker, StageResult, run_stage
 from .tools import ToolContext
 
 # Cap generation so the shared per-job budget (~1M cloud) leaves room for evaluation.
-GEN_TOKEN_CEILING = 650_000
+GEN_TOKEN_CEILING = 800_000
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +30,7 @@ _CLOUD_ROLES = {
     "profile": CLOUD_OPUS,
     "planner": CLOUD_OPUS,
     "analyst": CLOUD_OPUS,
+    "storyboard": CLOUD_OPUS,
     "coder": CLOUD_OPUS,
 }
 
@@ -99,14 +100,34 @@ Workflow:
 
 CRITICAL INSTRUCTION: Your analyze.py script MUST save the calculated, plot-ready data to separate files in an `outputs/` directory. NEVER inline full data arrays into findings.json. The `data_profile` must be generated programmatically by analyze.py to guarantee accuracy. Do not copy the original questions or rationales into findings.json; the system will merge those later."""
 
+STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
+
+Inputs: task.md and viz_context.json (read them).
+
+Workflow:
+1. Read the inputs to understand what was asked and what findings were computed.
+2. Figure out the most coherent way to arrange these findings into a unified dashboard.
+3. Write storyboard.json (at the workdir root): an object {"storyboard": { "hook": "...", "layout": [ ... ], "payoff": "..." }}.
+   - hook: The overarching introductory narrative setting up the dashboard.
+   - layout: An ordered array mapping the flow of the page. Each item dictates a section:
+     - ids: Array of finding IDs to include in this section.
+     - layout_hint: How to render it (e.g., "full-width interactive dashboard with tabs", "side-by-side static comparison", "single focused chart").
+     - narrative_build: The transitional text explaining this section and guiding the user.
+   - payoff: The concluding actionable takeaways or insights.
+4. Call finish.
+
+Keep the narrative tight, professional, and directly tied to the actual computed findings."""
+
 CODER_SYSTEM = """You are a web data-visualization engineer. Build ONE cohesive, self-contained, interactive artifact at dist/index.html that tells a clear story and lets a reviewer inspect the answers to the task.
 
 Read these (workdir root):
 - task.md — what was asked.
 - viz_context.json — the visualizations to build, under "visualizations_to_build". Each item has: id, question, rationale, expected_form, answer, method, caveats, and a `data_profile` = {filepath, format, schema, sample}. The `data_profile` tells you where the plot-ready data lives and its exact structure. Use the exact fields shown in `schema`/`sample` — never rename or invent keys (mismatched keys silently break charts).
+- storyboard.json — the structural layout and narrative text (hook, layout, payoff).
 
 Build:
 - Write source/build.py that reads each finding's data from its data_profile.filepath (relative to the workdir), embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
+- Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story. Render the specified finding IDs in the suggested `layout_hint` styles.
 - One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
 - For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
@@ -158,6 +179,12 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             model=pick_model("analyst"), max_steps=30,
         ),
         dict(
+            name="storyboard", system_prompt=STORYBOARD_SYSTEM,
+            user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write storyboard.json.",
+            tool_names=["read_file", "write_file"],
+            model=pick_model("storyboard"), max_steps=10,
+        ),
+        dict(
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
@@ -199,7 +226,7 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
     dist_ready = (workdir / "dist" / "index.html").exists()
     # Compact per-stage line, embedded in notes so it persists via generation.json.
     per_stage = " ".join(f"{s['stage']}={s['total_tokens']}({'ok' if s['finished'] else 'unfinished'})" for s in stages_meta)
-    notes = (f"staged pipeline (profile->planner->analyst->coder); tokens total={total}/{GEN_TOKEN_CEILING} "
+    notes = (f"staged pipeline (profile->planner->analyst->storyboard->coder); tokens total={total}/{GEN_TOKEN_CEILING} "
              f"[{per_stage}]; dist_ready={dist_ready}")
 
     print("[pipeline] token spend by stage:", file=sys.stderr)
