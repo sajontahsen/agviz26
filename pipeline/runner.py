@@ -61,7 +61,7 @@ def run_stage(
     client: Any,
     purpose: str = "generation",
     max_steps: int = 24,
-    prune_keep: int = 10,
+    max_history_tokens: int = 40_000,
     max_tokens: int = 8192,
     budget: BudgetTracker | None = None,
     low_water: int = 60_000,
@@ -109,7 +109,7 @@ def run_stage(
                 _log(name, f"no tool call twice; ending stage at step {step}")
                 return StageResult(name, {}, usage, step, finished=False)
             messages.append({"role": "user", "content": "Use the tools to make progress, then call finish with a short JSON summary."})
-            _prune(messages, prune_keep)
+            _prune(messages, max_history_tokens)
             continue
         idle_nudges = 0
 
@@ -128,7 +128,7 @@ def run_stage(
             output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
             messages.append(_tool_msg(call, output))
 
-        _prune(messages, prune_keep)
+        _prune(messages, max_history_tokens)
 
     _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']}")
     return StageResult(name, {}, usage, max_steps, finished=False)
@@ -147,13 +147,19 @@ def _accumulate(total: dict[str, int], last: dict[str, Any]) -> None:
         total[k] += int(last.get(k, 0) or 0)
 
 
-def _prune(messages: list[dict[str, Any]], keep: int) -> None:
-    """Elide tool results and assistant tool-call payloads older than the last `keep` tool turns, in place. Idempotent."""
-    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    if not keep or len(tool_idxs) <= keep:
-        return  # nothing old enough to prune
-    cutoff = tool_idxs[-keep]  # preserve this tool message and everything after
-    for i in range(cutoff):
+def _prune(messages: list[dict[str, Any]], max_history_tokens: int) -> None:
+    """Elide tool results and assistant tool-call payloads iteratively from oldest to newest until total estimated tokens is under max_history_tokens. Idempotent."""
+    def _est_tokens(msgs: list[dict[str, Any]]) -> int:
+        return sum(len(str(m)) // 4 for m in msgs)
+    
+    if _est_tokens(messages) <= max_history_tokens:
+        return
+
+    # Skip 0 and 1 (system and first user prompt)
+    for i in range(2, len(messages)):
+        if _est_tokens(messages) <= max_history_tokens:
+            break
+            
         m = messages[i]
         role = m.get("role")
         if role == "tool":

@@ -130,6 +130,7 @@ Build:
 - Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story. Render the specified finding IDs in the suggested `layout_hint` styles.
 - One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
 - For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
+- Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
