@@ -98,7 +98,7 @@ Workflow:
    - caveats: any data limitations (optional)
 4. Call finish.
 
-CRITICAL INSTRUCTION: Your analyze.py script MUST save the calculated, plot-ready data to separate files in an `outputs/` directory. NEVER inline full data arrays into findings.json. The `data_profile` must be generated programmatically by analyze.py to guarantee accuracy. Do not copy the original questions or rationales into findings.json; the system will merge those later."""
+CRITICAL INSTRUCTION: Your analyze.py script MUST save the calculated, plot-ready data to separate files in an `outputs/` directory. NEVER inline full data arrays into findings.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze.py to guarantee accuracy. Do not copy the original questions or rationales into findings.json; the system will merge those later."""
 
 STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
 
@@ -175,9 +175,9 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
         dict(
             name="analyst", system_prompt=ANALYST_SYSTEM,
-            user_prompt=f"WORKDIR={wd}\nRead questions.json/profile.json/task.md, then write and run source/analyze.py to emit findings.json.",
+            user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json, then write and run source/analyze.py to emit findings.json.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=30,
+            model=pick_model("analyst"), max_steps=20, max_history_tokens=20_000,
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -189,7 +189,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=50,
+            model=pick_model("coder"), max_steps=25, max_history_tokens=20_000,
         ),
     ]
 
@@ -204,6 +204,9 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
     _ensure_fallback_dist(workdir)
+
+    # Move intermediate JSON files to source/state/ for clean root directory
+    _cleanup_state_files(workdir)
 
     return _summarize(workdir, results)
 
@@ -226,7 +229,10 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
     ]
     dist_ready = (workdir / "dist" / "index.html").exists()
     # Compact per-stage line, embedded in notes so it persists via generation.json.
-    per_stage = " ".join(f"{s['stage']}={s['total_tokens']}({'ok' if s['finished'] else 'unfinished'})" for s in stages_meta)
+    per_stage = " ".join(
+        f"{s['stage']}={s['total_tokens']}({'ok' if s['finished'] else 'FAIL'},{s['steps']}s,in:{s.get('input_tokens',0)},out:{s.get('output_tokens',0)})"
+        for s in stages_meta
+    )
     notes = (f"staged pipeline (profile->planner->analyst->storyboard->coder); tokens total={total}/{GEN_TOKEN_CEILING} "
              f"[{per_stage}]; dist_ready={dist_ready}")
 
@@ -355,3 +361,16 @@ def _fallback_findings_html(workdir: Path) -> str:
         ans = escape(str(it.get("answer", "")))[:400]
         rows.append(f'<li><span class="k">{fid}:</span> {ans}</li>')
     return "<ul>" + "".join(rows) + "</ul>" if rows else "<p>No findings were available.</p>"
+
+
+def _cleanup_state_files(workdir: Path) -> None:
+    import shutil
+    state_dir = workdir / "source" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ["profile.json", "questions.json", "findings.json", "viz_context.json", "storyboard.json"]:
+        src = workdir / fname
+        if src.exists():
+            try:
+                shutil.move(str(src), str(state_dir / fname))
+            except OSError:
+                pass
