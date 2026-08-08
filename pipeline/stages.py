@@ -139,12 +139,17 @@ Plotly for statistical/comparative charts, Cytoscape only for network/graph find
 - The page must render from dist/index.html with no dev server;
 - Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast.
 
-You are judged on: data_fidelity (numbers match the findings), insightfulness (call out trends/exceptions/comparisons), narrative_coherence (hook->build->payoff, consistent encodings), visual_craft (right chart types, clear titles/axes/labels, disclosed scope), functionality (working interactions).
+You are judged on these:
+- functionality: interactions (filters, tooltips, selection) actually work.
+- data_fidelity: numbers on screen match the actual data.
+- visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
+- insightfulness: call out trends, exceptions, comparisons — not just raw charts.
+- narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
 
 Validation Loop:
 When the page is written, you MUST call the `verify` tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
 If `verify` reports ANY `console_errors` or `page_errors`:
-1. Use `str_replace` or rewrite to fix the bug in build.py/HTML.
+1. CRITICAL: Use `str_replace` or `bash` (sed) to fix the bug. DO NOT use `write_file` to rewrite the entire script for minor edits. Rewriting entire files wastes output tokens and will cause you to fail.
 2. Re-run `build.py` via bash to generate the new dist/index.html.
 3. Call `verify` again.
 Iterate until `verify` passes with 0 errors and non-empty charts. Then call finish with a short summary of the panels."""
@@ -177,7 +182,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="analyst", system_prompt=ANALYST_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json, then write and run source/analyze.py to emit findings.json.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=20, max_history_tokens=20_000,
+            model=pick_model("analyst"), max_steps=30, max_history_tokens=20_000, prune_keep=6,
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -189,7 +194,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=25, max_history_tokens=20_000,
+            model=pick_model("coder"), max_steps=40, max_history_tokens=20_000, prune_keep=6,
         ),
     ]
 
@@ -224,7 +229,7 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
     """Log per-stage token telemetry to stderr and into the returned ``notes`` (goes to generation.json)."""
     total = sum(r.usage["total_tokens"] for r in results)
     stages_meta = [
-        {"stage": r.name, "finished": r.finished, "steps": r.steps, **r.usage}
+        {"stage": r.name, "finished": r.finished, "steps": r.steps, "tool_counts": r.tool_counts, **r.usage}
         for r in results
     ]
     dist_ready = (workdir / "dist" / "index.html").exists()
@@ -238,7 +243,9 @@ def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
 
     print("[pipeline] token spend by stage:", file=sys.stderr)
     for s in stages_meta:
-        print(f"  {s['stage']:<9} finished={s['finished']} steps={s['steps']:<3} tokens={s['total_tokens']}", file=sys.stderr)
+        tc = s.get("tool_counts", {})
+        tc_str = " ".join(f"{k}={v}" for k, v in sorted(tc.items())) if tc else "-"
+        print(f"  {s['stage']:<11} finished={s['finished']} steps={s['steps']:<3} tokens={s['total_tokens']:<7} tools=[{tc_str}]", file=sys.stderr)
     print(f"[pipeline] TOTAL tokens={total}  dist_ready={dist_ready}", file=sys.stderr)
 
     return {

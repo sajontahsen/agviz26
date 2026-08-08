@@ -31,6 +31,7 @@ class StageResult:
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
     steps: int = 0
     finished: bool = False
+    tool_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,24 +56,31 @@ def run_stage(
     name: str,
     system_prompt: str,
     user_prompt: str,
-    tool_names: list[str],
+    tool_names: list[str] | None = None,
     model: str,
-    ctx: ToolContext,
+    ctx: Any,
     client: Any,
+    tool_schemas: list[dict[str, Any]] | None = None,
+    tool_executors: dict[str, Any] | None = None,
     purpose: str = "generation",
     max_steps: int = 24,
     max_history_tokens: int = 40_000,
+    prune_keep: int | None = None,
     max_tokens: int = 8192,
     budget: BudgetTracker | None = None,
     low_water: int = 60_000,
 ) -> StageResult:
-    schemas, execs = build_toolset(tool_names)
+    if tool_schemas is not None and tool_executors is not None:
+        schemas, execs = tool_schemas, tool_executors
+    else:
+        schemas, execs = build_toolset(tool_names or [])
     tools = [*schemas, _FINISH_SCHEMA]
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    tool_counts: dict[str, int] = {}
     idle_nudges = 0
     warned_budget = False
 
@@ -82,7 +90,7 @@ def run_stage(
         if budget is not None:
             if budget.exhausted():
                 _log(name, f"budget ceiling hit (spent={budget.spent}); stopping at step {step}")
-                return StageResult(name, {}, usage, step - 1, finished=False)
+                return StageResult(name, {}, usage, step - 1, finished=False, tool_counts=tool_counts)
             if not warned_budget and budget.remaining() < low_water:
                 warned_budget = True
                 messages.append({"role": "user", "content": (
@@ -107,9 +115,9 @@ def run_stage(
             idle_nudges += 1
             if idle_nudges >= 2:
                 _log(name, f"no tool call twice; ending stage at step {step}")
-                return StageResult(name, {}, usage, step, finished=False)
+                return StageResult(name, {}, usage, step, finished=False, tool_counts=tool_counts)
             messages.append({"role": "user", "content": "Use the tools to make progress, then call finish with a short JSON summary."})
-            _prune(messages, max_history_tokens)
+            _prune(messages, max_history_tokens, prune_keep)
             continue
         idle_nudges = 0
 
@@ -121,17 +129,18 @@ def run_stage(
             except json.JSONDecodeError as exc:
                 messages.append(_tool_msg(call, f"Tool argument JSON error: {exc}"))
                 continue
+            tool_counts[fname] = tool_counts.get(fname, 0) + 1
             if fname == "finish":
-                _log(name, f"finished at step {step}; tokens={usage['total_tokens']}")
-                return StageResult(name, args.get("result") or {}, usage, step, finished=True)
+                _log(name, f"finished at step {step}; tokens={usage['total_tokens']} tools={tool_counts}")
+                return StageResult(name, args.get("result") or {}, usage, step, finished=True, tool_counts=tool_counts)
             executor = execs.get(fname)
             output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
             messages.append(_tool_msg(call, output))
 
-        _prune(messages, max_history_tokens)
+        _prune(messages, max_history_tokens, prune_keep)
 
-    _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']}")
-    return StageResult(name, {}, usage, max_steps, finished=False)
+    _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']} tools={tool_counts}")
+    return StageResult(name, {}, usage, max_steps, finished=False, tool_counts=tool_counts)
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +156,23 @@ def _accumulate(total: dict[str, int], last: dict[str, Any]) -> None:
         total[k] += int(last.get(k, 0) or 0)
 
 
-def _prune(messages: list[dict[str, Any]], max_history_tokens: int) -> None:
-    """Elide tool results and assistant tool-call payloads iteratively from oldest to newest until total estimated tokens is under max_history_tokens. Idempotent."""
+def _prune(messages: list[dict[str, Any]], max_history_tokens: int, prune_keep: int | None = None) -> None:
+    """Elide tool results and assistant tool-call payloads by turn count and/or token estimation. Idempotent."""
+    # 1. Prune by hard turn count if specified
+    if prune_keep is not None:
+        tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        if len(tool_idxs) > prune_keep:
+            cutoff = tool_idxs[-prune_keep]
+            for i in range(2, cutoff):
+                m = messages[i]
+                role = m.get("role")
+                if role == "tool":
+                    if m.get("content") != _ELIDED:
+                        messages[i] = {**m, "content": _ELIDED}
+                elif role == "assistant" and m.get("tool_calls"):
+                    messages[i] = _shrink_assistant(m)
+
+    # 2. Prune by estimated token size
     def _est_tokens(msgs: list[dict[str, Any]]) -> int:
         return sum(len(str(m)) // 4 for m in msgs)
     

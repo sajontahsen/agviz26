@@ -146,12 +146,9 @@ def generate(workdir: Path) -> dict[str, Any]:
 
 
 def evaluate(workdir: Path, artifact_url: str) -> dict[str, Any]:
-    return _run_tool_loop(
-        EVALUATION_PROMPT,
-        f"WORKDIR={workdir}\nARTIFACT_URL={artifact_url}",
-        tool_root=workdir,
-        purpose="evaluation",
-    )
+    from pipeline.evaluator import run_evaluation
+
+    return run_evaluation(workdir, artifact_url)
 
 
 # ---------------------------------------------------------------------------
