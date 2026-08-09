@@ -81,7 +81,7 @@ A single "question" (e.g., expected_form: interactive_dashboard) can encompass m
 Organize the questions with this strict mechanical reality in mind: later, one agent has to compute the pandas logic then calculate answers for these questions, and another agent has to code the UI dashboard for them. Both operate under strict token budgets. If you create queries that are too complex, the downstream agents will crash and the question will remain entirely unanswered. Be safe and gentle. Prioritize the core narrative. It is better to have clean, working charts than to crash trying to cover every secondary metric. 
 Then call finish."""
 
-ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answer for a specific target question directly from the raw dataset. These numbers become the ground truth the visualization displays, so correctness is paramount.
+ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answer for a specific target question directly from the raw dataset. These numbers become the ground truth the visualization displays..
 
 Inputs: task.md, profile.json, and the TARGET QUESTION (provided in your prompt). Raw data is in data/.
 
@@ -100,7 +100,18 @@ Workflow:
    - caveats: any data limitations (optional)
 4. Call finish.
 
-CRITICAL INSTRUCTION: Your analyze_{id}.py script MUST save the calculated, plot-ready data to a file in the `outputs/` directory. NEVER inline full data arrays into findings_{id}.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze_{id}.py to guarantee accuracy. Do not copy the original question or rationale into findings_{id}.json; the system will merge those later."""
+
+CRITICAL INSTRUCTIONS: 
+- Your analyze_{id}.py script MUST save the calculated, plot-ready data to a file in the `outputs/` directory. NEVER inline full data arrays into findings_{id}.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze_{id}.py to guarantee accuracy. Do not copy the original question or rationale into findings_{id}.json; the system will merge those later.
+
+- Design the whole computation before writing code: which columns or edge types, which aggregations, what the output table looks like. Then write the script once, complete. Do not build it up interactively across several runs. Do not print or inspect the data to "understand it first". profile.json already gives you the schema and sample values. Go straight to computing the answer.
+
+- Here's your implementation ladder:
+Run 1: your full intended analysis.
+Run 2 (if errored): fix the error only — do not redesign.
+Run 3 (if errored): rewrite it the simplest way that works, answer one core question, dont have to answer everything at this point
+
+There is no run 4. If you are on your third execution, the answer you have is theanswer you ship: save findings_{id}.json and finish"""
 
 STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
 
@@ -136,8 +147,7 @@ Build:
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
-  Cytoscape.js https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js
-Plotly for statistical/comparative charts, Cytoscape only for network/graph findings. Never render tens of thousands of nodes raw.
+- Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
 - Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast.
 
@@ -205,10 +215,6 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     for spec in specs:
         if spec["name"] == "analyst":
             (workdir / "findings.json").write_text(json.dumps({"findings": []}))
-            agg_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-            agg_steps = 0
-            agg_finished = True
-            agg_tool_counts: dict[str, int] = {}
             
             q_file = workdir / "questions.json"
             questions = []
@@ -230,7 +236,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
                 sub_spec["name"] = f"analyst_{qid}"
                 sub_spec["user_prompt"] = q_prompt
                 sub_spec["prune_keep"] = 2
-                sub_spec["max_history_tokens"] = 6_000
+                sub_spec["max_history_tokens"] = 12_000
                 sub_spec["low_water"] = 5_000
                 
                 q_ceiling = min(30_000, 200_000 - analyst_spent, budget.remaining())
@@ -239,19 +245,12 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
                 q_budget = BudgetTracker(ceiling=q_ceiling)
                 
                 r = _safe_run(ctx=ctx, client=client, budget=q_budget, **sub_spec)
+                results.append(r)
                 
                 spent_here = r.usage.get("total_tokens", 0)
                 analyst_spent += spent_here
                 budget.spent += spent_here
                 
-                for k in agg_usage:
-                    agg_usage[k] += r.usage.get(k, 0)
-                agg_steps += r.steps
-                if not r.finished:
-                    agg_finished = False
-                for k, v in r.tool_counts.items():
-                    agg_tool_counts[k] = agg_tool_counts.get(k, 0) + v
-                    
                 if r.finished:
                     f_file = workdir / f"findings_{qid}.json"
                     if f_file.exists():
@@ -262,11 +261,6 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
                             (workdir / "findings.json").write_text(json.dumps(main_data, indent=2))
                         except Exception:
                             pass
-                        
-            results.append(StageResult(
-                name="analyst", result={}, usage=agg_usage, steps=agg_steps, 
-                finished=agg_finished, tool_counts=agg_tool_counts
-            ))
             _safe_merge_context(workdir)
         else:
             results.append(_safe_run(ctx=ctx, client=client, budget=budget, **spec))
@@ -291,24 +285,33 @@ def _safe_run(*, ctx: ToolContext, client: Any, name: str, **kwargs: Any) -> Sta
 
 
 def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
-    """Build a ``notes`` string that carries all telemetry into generation.json (the only field agent.py reads)."""
-    total = sum(r.usage["total_tokens"] for r in results)
+    """Build a rich telemetry dict for generation.json (the framework reads the notes key)."""
+    total = sum(r.usage.get("total_tokens", 0) for r in results)
     dist_ready = (workdir / "dist" / "index.html").exists()
 
-    lines = [f"pipeline: tokens={total}/{GEN_TOKEN_CEILING} dist_ready={dist_ready}"]
+    stages_meta = []
     for r in results:
-        tc = r.tool_counts
-        tc_str = " ".join(f"{k}={v}" for k, v in sorted(tc.items())) if tc else "-"
-        status = "ok" if r.finished else "FAIL"
-        lines.append(
-            f"  {r.name:<11} {status:<4} steps={r.steps:<3} "
-            f"in={r.usage.get('input_tokens',0)} out={r.usage.get('output_tokens',0)} "
-            f"total={r.usage['total_tokens']} tools=[{tc_str}]"
-        )
+        stages_meta.append({
+            "stage": r.name,
+            "finished": r.finished,
+            "steps": r.steps,
+            "usage": r.usage,
+            "tool_counts": r.tool_counts,
+        })
+        
+    notes_data = {
+        "pipeline": {
+            "total_tokens": total,
+            "ceiling": GEN_TOKEN_CEILING,
+            "dist_ready": dist_ready,
+        },
+        "stages": stages_meta
+    }
+    
+    notes_str = json.dumps(notes_data, indent=2)
+    print(f"[pipeline]\n{notes_str}", file=sys.stderr)
+    return {"notes": notes_data}
 
-    notes = "\n".join(lines)
-    print(f"[pipeline]\n{notes}", file=sys.stderr)
-    return {"notes": notes}
 
 
 # ---------------------------------------------------------------------------

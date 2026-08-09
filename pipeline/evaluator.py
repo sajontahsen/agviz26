@@ -120,7 +120,7 @@ def run_evaluation(workdir: Path, artifact_url: str) -> dict[str, Any]:
             client=client,
             tool_schemas=schemas,
             tool_executors=executors,
-            max_steps=15,
+            max_steps=30,
             max_history_tokens=30_000,
         )
     finally:
