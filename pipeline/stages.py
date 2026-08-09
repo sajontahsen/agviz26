@@ -77,7 +77,9 @@ Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Ea
   - expected_form: one of scalar | series | table | ranking | breakdown | interactive_dashboard
   - supports: which task requirement or narrative beat it serves
 
-Aim for a strict bound of 5-6 questions. A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns). However, do NOT pack multiple distinct queries or dimensions into every single question (e.g., asking for volume AND citations AND authors in one question). Instead, spread them out: 3-4 questions should be simple, highly targeted data aggregations (e.g., just "volume over time" or just "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights. This ensures downstream agents can reliably compute the data without crashing. Balance deep statistical insights with broad token-efficient exploration, envision the final artifact as a story dashboard. Ensure all data views remain meaningful and purposeful. Then call finish."""
+A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns). However, do NOT pack multiple distinct queries or dimensions into every single question (e.g., asking for volume AND citations AND authors in one question). Instead, spread them out: 3-4 questions should be simple, highly targeted data aggregations (e.g., just "volume over time" or just "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights. This ensures downstream agents can reliably compute the data without crashing. Balance deep statistical insights with broad token-efficient exploration, envision the final artifact as a story dashboard. Ensure all data views remain meaningful and purposeful. 
+Organize the questions with this strict mechanical reality in mind: later, one agent has to compute the pandas logic then calculate answers for these questions, and another agent has to code the UI dashboard for them. Both operate under strict token budgets. If you create queries that are too complex, the downstream agents will crash and the question will remain entirely unanswered. Be safe and gentle. Prioritize the core narrative. It is better to have clean, working charts than to crash trying to cover every secondary metric. 
+Then call finish."""
 
 ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answer for a specific target question directly from the raw dataset. These numbers become the ground truth the visualization displays, so correctness is paramount.
 
@@ -216,15 +218,31 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
                 except Exception:
                     pass
             
+            analyst_spent = 0
             for q in questions:
+                if analyst_spent >= 200_000:
+                    break
+                    
                 qid = q.get("id", "unknown")
                 q_prompt = f"WORKDIR={wd}\nTARGET QUESTION:\n{json.dumps(q, indent=2)}\nRead task.md and profile.json. Write and run source/analyze_{qid}.py to emit findings_{qid}.json."
                 
                 sub_spec = dict(spec)
                 sub_spec["name"] = f"analyst_{qid}"
                 sub_spec["user_prompt"] = q_prompt
+                sub_spec["prune_keep"] = 2
+                sub_spec["max_history_tokens"] = 6_000
+                sub_spec["low_water"] = 5_000
                 
-                r = _safe_run(ctx=ctx, client=client, budget=budget, **sub_spec)
+                q_ceiling = min(30_000, 200_000 - analyst_spent, budget.remaining())
+                if q_ceiling <= 0:
+                    break
+                q_budget = BudgetTracker(ceiling=q_ceiling)
+                
+                r = _safe_run(ctx=ctx, client=client, budget=q_budget, **sub_spec)
+                
+                spent_here = r.usage.get("total_tokens", 0)
+                analyst_spent += spent_here
+                budget.spent += spent_here
                 
                 for k in agg_usage:
                     agg_usage[k] += r.usage.get(k, 0)
@@ -234,15 +252,16 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
                 for k, v in r.tool_counts.items():
                     agg_tool_counts[k] = agg_tool_counts.get(k, 0) + v
                     
-                f_file = workdir / f"findings_{qid}.json"
-                if f_file.exists():
-                    try:
-                        f_data = json.loads(f_file.read_text())
-                        main_data = json.loads((workdir / "findings.json").read_text())
-                        main_data["findings"].extend(f_data.get("findings", []))
-                        (workdir / "findings.json").write_text(json.dumps(main_data, indent=2))
-                    except Exception:
-                        pass
+                if r.finished:
+                    f_file = workdir / f"findings_{qid}.json"
+                    if f_file.exists():
+                        try:
+                            f_data = json.loads(f_file.read_text())
+                            main_data = json.loads((workdir / "findings.json").read_text())
+                            main_data["findings"].extend(f_data.get("findings", []))
+                            (workdir / "findings.json").write_text(json.dumps(main_data, indent=2))
+                        except Exception:
+                            pass
                         
             results.append(StageResult(
                 name="analyst", result={}, usage=agg_usage, steps=agg_steps, 
@@ -312,7 +331,9 @@ def _merge_context(workdir: Path) -> None:
     for q in questions:
         if not isinstance(q, dict) or not q.get("id"):
             continue
-        finding = findings_dict.get(q["id"], {})
+        if q["id"] not in findings_dict:
+            continue
+        finding = findings_dict[q["id"]]
         enriched.append({
             "id": q["id"],
             "question": q.get("question"),
