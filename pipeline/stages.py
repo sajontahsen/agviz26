@@ -79,18 +79,18 @@ Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Ea
 
 Aim for a strict bound of 5-6 questions. To balance deep statistical insights with broad token-efficient exploration, envision the final artifact as a unified dashboard. A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns), meaning 5 questions does NOT artificially limit the artifact to only 5 charts. Ensure all data views remain meaningful and purposeful. Then call finish."""
 
-ANALYST_SYSTEM = """You are a data ANALYST agent. Compute correct, verified answers to a set of questions directly from the raw dataset. These numbers become the ground truth the visualization displays, so correctness is paramount.
+ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answer for a specific target question directly from the raw dataset. These numbers become the ground truth the visualization displays, so correctness is paramount.
 
-Inputs: task.md, profile.json, and questions.json (read all three). Raw data is in data/.
+Inputs: task.md, profile.json, and the TARGET QUESTION (provided in your prompt). Raw data is in data/.
 
 Workflow:
-1. Read questions.json and profile.json.
-2. Write source/analyze.py that loads data/ and computes an answer for EACH question id. Run it with bash; iterate until clean.
-3. Emit findings.json (at the workdir root): {"findings": [ {id, answer, data_profile, method, caveats} ... ]} where
-   - id: Must exactly match the id from questions.json
+1. Read profile.json and understand your TARGET QUESTION.
+2. Write source/analyze_{id}.py that loads data/ and computes the answer for your assigned question id. Run it with bash; iterate until clean.
+3. Emit findings_{id}.json (at the workdir root): {"findings": [ {id, answer, data_profile, method, caveats} ]} where
+   - id: Must exactly match your assigned id
    - answer: concise plain-language answer
    - data_profile: A schema definition containing:
-        - "filepath": Local path where analyze.py saved the dataset (e.g., "outputs/<id>.csv" or "outputs/<id>.json"). Choose the best format for the data shape.
+        - "filepath": Local path where analyze_{id}.py saved the dataset (e.g., "outputs/{id}.csv" or "outputs/{id}.json"). Choose the best format for the data shape.
         - "format": "csv" or "json"
         - "schema": For tabular data, map columns to types. For graphs/nested data, describe the structure.
         - "sample": A minimal snippet (e.g., 2 rows, or 1 node/edge) showing exact structure.
@@ -98,7 +98,7 @@ Workflow:
    - caveats: any data limitations (optional)
 4. Call finish.
 
-CRITICAL INSTRUCTION: Your analyze.py script MUST save the calculated, plot-ready data to separate files in an `outputs/` directory. NEVER inline full data arrays into findings.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze.py to guarantee accuracy. Do not copy the original questions or rationales into findings.json; the system will merge those later."""
+CRITICAL INSTRUCTION: Your analyze_{id}.py script MUST save the calculated, plot-ready data to a file in the `outputs/` directory. NEVER inline full data arrays into findings_{id}.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze_{id}.py to guarantee accuracy. Do not copy the original question or rationale into findings_{id}.json; the system will merge those later."""
 
 STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
 
@@ -180,9 +180,9 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
         dict(
             name="analyst", system_prompt=ANALYST_SYSTEM,
-            user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json, then write and run source/analyze.py to emit findings.json.",
+            user_prompt="", # Injected dynamically
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=30, max_history_tokens=20_000, prune_keep=6,
+            model=pick_model("analyst"), max_steps=20, max_history_tokens=20_000, prune_keep=6,
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -201,10 +201,56 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     budget = BudgetTracker(ceiling=GEN_TOKEN_CEILING)
     results: list[StageResult] = []
     for spec in specs:
-        results.append(_safe_run(ctx=ctx, client=client, budget=budget, **spec))
         if spec["name"] == "analyst":
-            # Deterministic join of questions x findings -> viz_context.json.
+            (workdir / "findings.json").write_text(json.dumps({"findings": []}))
+            agg_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            agg_steps = 0
+            agg_finished = True
+            agg_tool_counts: dict[str, int] = {}
+            
+            q_file = workdir / "questions.json"
+            questions = []
+            if q_file.exists():
+                try:
+                    questions = json.loads(q_file.read_text()).get("questions", [])
+                except Exception:
+                    pass
+            
+            for q in questions:
+                qid = q.get("id", "unknown")
+                q_prompt = f"WORKDIR={wd}\nTARGET QUESTION:\n{json.dumps(q, indent=2)}\nRead task.md and profile.json. Write and run source/analyze_{qid}.py to emit findings_{qid}.json."
+                
+                sub_spec = dict(spec)
+                sub_spec["name"] = f"analyst_{qid}"
+                sub_spec["user_prompt"] = q_prompt
+                
+                r = _safe_run(ctx=ctx, client=client, budget=budget, **sub_spec)
+                
+                for k in agg_usage:
+                    agg_usage[k] += r.usage.get(k, 0)
+                agg_steps += r.steps
+                if not r.finished:
+                    agg_finished = False
+                for k, v in r.tool_counts.items():
+                    agg_tool_counts[k] = agg_tool_counts.get(k, 0) + v
+                    
+                f_file = workdir / f"findings_{qid}.json"
+                if f_file.exists():
+                    try:
+                        f_data = json.loads(f_file.read_text())
+                        main_data = json.loads((workdir / "findings.json").read_text())
+                        main_data["findings"].extend(f_data.get("findings", []))
+                        (workdir / "findings.json").write_text(json.dumps(main_data, indent=2))
+                    except Exception:
+                        pass
+                        
+            results.append(StageResult(
+                name="analyst", result={}, usage=agg_usage, steps=agg_steps, 
+                finished=agg_finished, tool_counts=agg_tool_counts
+            ))
             _safe_merge_context(workdir)
+        else:
+            results.append(_safe_run(ctx=ctx, client=client, budget=budget, **spec))
 
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
@@ -226,34 +272,24 @@ def _safe_run(*, ctx: ToolContext, client: Any, name: str, **kwargs: Any) -> Sta
 
 
 def _summarize(workdir: Path, results: list[StageResult]) -> dict[str, Any]:
-    """Log per-stage token telemetry to stderr and into the returned ``notes`` (goes to generation.json)."""
+    """Build a ``notes`` string that carries all telemetry into generation.json (the only field agent.py reads)."""
     total = sum(r.usage["total_tokens"] for r in results)
-    stages_meta = [
-        {"stage": r.name, "finished": r.finished, "steps": r.steps, "tool_counts": r.tool_counts, **r.usage}
-        for r in results
-    ]
     dist_ready = (workdir / "dist" / "index.html").exists()
-    # Compact per-stage line, embedded in notes so it persists via generation.json.
-    per_stage = " ".join(
-        f"{s['stage']}={s['total_tokens']}({'ok' if s['finished'] else 'FAIL'},{s['steps']}s,in:{s.get('input_tokens',0)},out:{s.get('output_tokens',0)})"
-        for s in stages_meta
-    )
-    notes = (f"staged pipeline (profile->planner->analyst->storyboard->coder); tokens total={total}/{GEN_TOKEN_CEILING} "
-             f"[{per_stage}]; dist_ready={dist_ready}")
 
-    print("[pipeline] token spend by stage:", file=sys.stderr)
-    for s in stages_meta:
-        tc = s.get("tool_counts", {})
+    lines = [f"pipeline: tokens={total}/{GEN_TOKEN_CEILING} dist_ready={dist_ready}"]
+    for r in results:
+        tc = r.tool_counts
         tc_str = " ".join(f"{k}={v}" for k, v in sorted(tc.items())) if tc else "-"
-        print(f"  {s['stage']:<11} finished={s['finished']} steps={s['steps']:<3} tokens={s['total_tokens']:<7} tools=[{tc_str}]", file=sys.stderr)
-    print(f"[pipeline] TOTAL tokens={total}  dist_ready={dist_ready}", file=sys.stderr)
+        status = "ok" if r.finished else "FAIL"
+        lines.append(
+            f"  {r.name:<11} {status:<4} steps={r.steps:<3} "
+            f"in={r.usage.get('input_tokens',0)} out={r.usage.get('output_tokens',0)} "
+            f"total={r.usage['total_tokens']} tools=[{tc_str}]"
+        )
 
-    return {
-        "notes": notes,
-        "total_tokens": total,
-        "stages": stages_meta,
-        "dist_ready": dist_ready,
-    }
+    notes = "\n".join(lines)
+    print(f"[pipeline]\n{notes}", file=sys.stderr)
+    return {"notes": notes}
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +410,12 @@ def _cleanup_state_files(workdir: Path) -> None:
     import shutil
     state_dir = workdir / "source" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ["profile.json", "questions.json", "findings.json", "viz_context.json", "storyboard.json"]:
+    
+    files_to_move = ["profile.json", "questions.json", "findings.json", "viz_context.json", "storyboard.json"]
+    for f in workdir.glob("findings_*.json"):
+        files_to_move.append(f.name)
+        
+    for fname in files_to_move:
         src = workdir / fname
         if src.exists():
             try:

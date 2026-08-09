@@ -128,8 +128,11 @@ def run_stage(
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError as exc:
                 messages.append(_tool_msg(call, f"Tool argument JSON error: {exc}"))
+                if fname:
+                    tool_counts[fname] = tool_counts.get(fname, 0) + 1
                 continue
-            tool_counts[fname] = tool_counts.get(fname, 0) + 1
+            if fname:
+                tool_counts[fname] = tool_counts.get(fname, 0) + 1
             if fname == "finish":
                 _log(name, f"finished at step {step}; tokens={usage['total_tokens']} tools={tool_counts}")
                 return StageResult(name, args.get("result") or {}, usage, step, finished=True, tool_counts=tool_counts)
