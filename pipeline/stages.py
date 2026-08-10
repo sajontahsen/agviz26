@@ -165,12 +165,13 @@ Build:
 - Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story. Render the specified finding IDs in the suggested `layout_hint` styles.
 - One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
 - For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
-- Follow data visualization best practices. Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
+- Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
+- Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast. 
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
@@ -180,30 +181,12 @@ You are judged on these:
 - narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
 
 Validation Loop:
-You must verify the page programmatically using verify's `actions` parameter and the text fields it returns.
+When the page is written, you MUST call the `verify` tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
+If `verify` reports any errors/discrepency:
+1. Use `str_replace` or rewrite to fix the bug in build.py/HTML.
+2. Re-run `build.py` via bash to generate the new dist/index.html.
+3. Call `verify` again.
 
-When the page is written, call `verify` with DOM-check actions:
-  verify(actions=[
-    {"do": "count", "selector": ".js-plotly-plot"},
-    {"do": "count", "selector": "svg"},
-    {"do": "count", "selector": "button, select, [role=tab]"},
-    {"do": "text",  "selector": "h1, h2, h3"}
-  ])
-
-Check the response for:
-- console_errors / page_errors: any means broken JS — fix and re-verify.
-- count '.js-plotly-plot': 0 means no Plotly charts rendered (even if the
-  divs exist). Fix data binding / Plotly.newPlot calls.
-- count 'svg': 0 with expected charts means the library failed to draw.
-- count of interactive controls: 0 when you built controls means they are
-  missing from the DOM.
-- text of headings: confirms section titles rendered.
-
-If ANY check fails:
-1. Use `str_replace` or `bash` (sed) to fix the bug — do NOT rewrite the
-   entire build.py for minor edits.
-2. Re-run `build.py` via bash.
-3. Call `verify` again with the same actions.
 Iterate until verify passes with 0 errors and working charts. Then call finish with a short summary of the panels."""
 
 # ---------------------------------------------------------------------------
@@ -222,31 +205,31 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="profile", system_prompt=PROFILE_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nProfile the dataset. Read task.md and data/, then write and run source/profile.py to emit profile.json.",
             tool_names=["read_file", "write_file", "str_replace", "bash"],
-            model=pick_model("profile"), max_steps=20,
+            model=pick_model("profile"), max_steps=15,
         ),
         dict(
             name="planner", system_prompt=PLANNER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and profile.json, then write questions.json.",
             tool_names=["read_file", "write_file"],
-            model=pick_model("planner"), max_steps=14,
+            model=pick_model("planner"), max_steps=15,
         ),
         dict(
             name="analyst", system_prompt=ANALYST_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json. Write and run a single source/analyze.py script to process all questions. For each question, save findings_{{id}}.json to the workdir. Iterate until all questions are answered or you hit a blocker you cannot pass.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=30, max_history_tokens=20_000, prune_keep=4,
+            model=pick_model("analyst"), max_steps=50, max_history_tokens=20_000, prune_keep=4, low_water=15_000
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write storyboard.json.",
             tool_names=["read_file", "write_file"],
-            model=pick_model("storyboard"), max_steps=10,
+            model=pick_model("storyboard"), max_steps=15,
         ),
         dict(
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=40, max_history_tokens=20_000, prune_keep=4,
+            model=pick_model("coder"), max_steps=80, max_history_tokens=20_000, prune_keep=4,
         ),
     ]
 

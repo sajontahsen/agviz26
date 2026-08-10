@@ -83,6 +83,7 @@ def run_stage(
     tool_counts: dict[str, int] = {}
     idle_nudges = 0
     warned_budget = False
+    warned_steps = False
 
     for step in range(1, max_steps + 1):
         # Budget gate: stop before making a call that would overrun the shared
@@ -94,9 +95,16 @@ def run_stage(
             if not warned_budget and budget.remaining() < low_water:
                 warned_budget = True
                 messages.append({"role": "user", "content": (
-                    f"Token budget is nearly exhausted (~{budget.remaining()} left). Stop exploring now: "
-                    "save the best artifact you can, run verify once, and call finish immediately."
+                    f"Your token budget is nearly exhausted (~{budget.remaining()} left). Stop exploring now: "
+                    "save the best artifact you can, and call finish immediately."
                 )})
+                
+        if not warned_steps and step >= max_steps - 3:
+            warned_steps = True
+            messages.append({"role": "user", "content": (
+                f"You are approaching the maximum number of steps (ie steps of the llm messaging loop) allowed for this stage (2 steps left). Stop exploring now: "
+                "save the best artifact you can, and call finish immediately."
+            )})
 
         message = client.create(
             model=model,
