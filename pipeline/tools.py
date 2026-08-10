@@ -24,8 +24,8 @@ class ToolContext:
     """Shared state handed to every tool executor within a stage."""
 
     tool_root: Path
-    # Where verify() drops screenshots; created lazily.
     artifacts_dir: Path = field(init=False)
+    _verify_count: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.tool_root = Path(self.tool_root).resolve()
@@ -163,7 +163,7 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
 
 
 def verify(args: dict[str, Any], ctx: ToolContext) -> str:
-    """Render an artifact (serving dist/ if no ``url``) and return a compact health summary: console errors, title, text, screenshot."""
+    """Render an artifact and return a health summary with automatic chart/control diagnostics."""
     url = args.get("url")
     actions = args.get("actions") or []
     try:
@@ -172,7 +172,8 @@ def verify(args: dict[str, Any], ctx: ToolContext) -> str:
         return f"verify unavailable: Playwright not importable ({exc}). Skipping render check."
 
     ctx.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    shot = ctx.artifacts_dir / "verify.png"
+    ctx._verify_count += 1
+    shot = ctx.artifacts_dir / f"verify_{ctx._verify_count}.png"
 
     with _maybe_serve(url, ctx.tool_root / "dist") as resolved_url:
         return _clip(_playwright_probe(resolved_url, actions, shot))
@@ -181,6 +182,57 @@ def verify(args: dict[str, Any], ctx: ToolContext) -> str:
 # ---------------------------------------------------------------------------
 # Playwright helpers (kept out of the model's hands so scripts are reliable)
 # ---------------------------------------------------------------------------
+
+_CHART_HEALTH_JS = """() => {
+    const plots = [...document.querySelectorAll('.js-plotly-plot')];
+    // Points, not traces: a trace with x:[]/y:[] draws nothing.
+    const detail = plots.map(el => {
+        const d = el.data || [];
+        const pts = d.reduce((a, t) => a + ((t.y || t.values || t.x || []).length), 0);
+        const r = el.getBoundingClientRect();
+        return {id: el.id || '(anon)', traces: d.length, points: pts,
+                h: Math.round(r.height), w: Math.round(r.width)};
+    });
+    return {
+        plotly_total: plots.length,
+        svg: document.querySelectorAll('svg').length,
+        canvas: document.querySelectorAll('canvas').length,
+        detail: detail,
+        no_points: detail.filter(p => p.points === 0).map(p => p.id),
+        zero_size: detail.filter(p => p.h < 5 || p.w < 5).map(p => p.id),
+    };
+}"""
+
+_CONTROLS_JS = """() => {
+    const sels = 'button, select, input, [role=tab], [role=button], [onclick]';
+    const els = document.querySelectorAll(sels);
+    const counts = {};
+    els.forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        const key = el.type ? tag + ':' + el.type : tag;
+        counts[key] = (counts[key] || 0) + 1;
+    });
+    return {total: els.length, breakdown: counts};
+}"""
+
+# Page prose only — inner_text('body') scrapes every SVG axis tick label too.
+_BODY_TEXT_JS = """() => {
+    const skip = new Set(['SVG', 'SCRIPT', 'STYLE', 'NOSCRIPT']);
+    const out = [];
+    const walk = (n) => {
+        for (const c of n.childNodes) {
+            if (c.nodeType === 3) {
+                const t = c.textContent.trim();
+                if (t) out.push(t);
+            } else if (c.nodeType === 1 && !skip.has(c.tagName.toUpperCase())) {
+                walk(c);
+            }
+        }
+    };
+    walk(document.body);
+    return out.join('\\n');
+}"""
+
 
 def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> str:
     from playwright.sync_api import sync_playwright
@@ -196,7 +248,9 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
             page.on("pageerror", lambda e: page_errors.append(str(e)))
             page.goto(url, wait_until="networkidle", timeout=45000)
             title = page.title()
-            text = page.inner_text("body")[:1500]
+            text = page.evaluate(_BODY_TEXT_JS)[:1500]
+            charts = page.evaluate(_CHART_HEALTH_JS)
+            controls = page.evaluate(_CONTROLS_JS)
             for act in actions:
                 action_log.append(_run_action(page, act))
             page.screenshot(path=str(shot), full_page=False)
@@ -204,11 +258,23 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
     except Exception as exc:
         return f"verify error while rendering {url}: {exc}"
 
+    ctrl_str = ", ".join(f"{k}={v}" for k, v in sorted(controls["breakdown"].items())) if controls["breakdown"] else "none"
+    chart_str = " ".join(f"{p['id']}(t={p['traces']},pts={p['points']},{p['w']}x{p['h']})" for p in charts["detail"])
     parts = [
         f"url: {url}",
         f"title: {title!r}",
         f"console_errors ({len(console_errors)}): " + ("; ".join(console_errors[:10]) or "none"),
         f"page_errors ({len(page_errors)}): " + ("; ".join(page_errors[:10]) or "none"),
+        f"charts: plotly={charts['plotly_total']} svg={charts['svg']} canvas={charts['canvas']}",
+    ]
+    if chart_str:
+        parts.append(f"  {chart_str}")
+    if charts["no_points"]:
+        parts.append(f"  EMPTY (no data points): {', '.join(charts['no_points'])}")
+    if charts["zero_size"]:
+        parts.append(f"  ZERO-SIZE (not visible): {', '.join(charts['zero_size'])}")
+    parts += [
+        f"controls ({controls['total']}): {ctrl_str}",
         f"screenshot: {shot}",
     ]
     if action_log:
@@ -237,7 +303,9 @@ def _run_action(page: Any, act: dict[str, Any]) -> str:
             return f"text {sel!r}: {page.locator(sel).first.inner_text()[:200]!r}"
         return f"unknown action {act!r}"
     except Exception as exc:
-        return f"{kind} {sel!r}: FAILED ({exc})"
+        # Drop Playwright's retry call log (~1.5k chars) — keep the reason.
+        reason = str(exc).strip().splitlines()[0][:200]
+        return f"{kind} {sel!r}: FAILED ({reason})"
 
 
 @contextmanager

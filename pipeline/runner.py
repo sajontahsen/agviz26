@@ -113,10 +113,10 @@ def run_stage(
         calls = message.get("tool_calls") or []
         if not calls:
             idle_nudges += 1
-            if idle_nudges >= 2:
+            if idle_nudges >= 3:
                 _log(name, f"no tool call twice; ending stage at step {step}")
                 return StageResult(name, {}, usage, step, finished=False, tool_counts=tool_counts)
-            messages.append({"role": "user", "content": "Use the tools to make progress, then call finish with a short JSON summary."})
+            messages.append({"role": "user", "content": "No tool calls made indicates stalling. Use the tools to make progress, eg write the script then run it with bash. Once the task is done, call finish with a short JSON summary."})
             _prune(messages, max_history_tokens, prune_keep)
             continue
         idle_nudges = 0

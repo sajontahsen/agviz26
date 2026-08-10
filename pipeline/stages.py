@@ -53,21 +53,44 @@ Rules:
 - Data may be tabular (CSV) OR non-tabular (e.g. a JSON knowledge graph). Detect the shape and profile accordingly.
 
 Workflow:
-1. read_file task.md and list data/ to see the files and their formats.
+1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats. 
 2. Write source/profile.py that emits profile.json (at the workdir root). Run it with bash. Iterate until it runs cleanly.
 3. Call finish with a one-line summary.
 
-profile.json must be compact (aim < 40KB) and include:
-- files: name, format, size.
-- For tabular data: per-column {name, dtype, null_fraction, distinct_count, min, max, and up to 5 example values}; row_count.
-- For graph data: node_count, edge_count; node types with counts; edge types with counts; per node-type attribute coverage (which attrs, % present); degree stats; any temporal fields with min/max year.
+profile.json exists so the ANALYST agent can write correct code on its first attempt
+WITHOUT opening the raw data. Judge every field by that test. Whatever the shape
+— tabular, graph, nested JSON, geospatial, time series, or something you have not
+seen before — it MUST include:
+
+- load: the literal Python expression that loads the file(s).
+- accessors: the exact top-level keys / column names / field names / datatypes, copied
+  verbatim including capitalisation and spaces.
+- samples: one RAW record per record type, straight from the file, long string
+  values truncated to ~80 chars. For a graph: one node per node type and one edge
+  per edge type, showing real field names and how endpoints are referenced.
+  Emit each sample as a JSON OBJECT, never as a pre-serialized string. Every key
+  the record has must be present — a sample missing keys is worse than no sample,
+  because the analyst will code against what it sees.
+  Shorten samples by truncating VALUES, never the structure:
+  - string value longer than 80 chars -> first 80 chars + "…"
+  - array longer than 3 items         -> first 3 items + "…(N total)"
+  - nested object deeper than 2 levels -> keep keys, replace the value with "{…}"
+  Never slice the serialized JSON text, and never drop trailing keys to save space.
+  Preserve the JSON type of every value. Do not stringify numbers, booleans, or
+  nulls. The analyst needs to see that `"id": 17255` is an integer and not "17255",
+  and that `"notable": true` is a boolean — guessing these wrong is a debug loop.
+- conventions: anything ambiguous a reader would otherwise guess wrong — edge
+  direction semantics, units, date formats, null encodings, id types.
+- entities: for every specific person/place/thing named in task.md, its resolved
+  id and type.
+
 Prefer pandas/networkx. Keep example lists short."""
 
 PLANNER_SYSTEM = """You are a visualization PLANNING agent. You do NOT write code and you do NOT compute answers. You decompose the task into the analytical questions whose answers will drive an insightful, well-structured visualization.
 
 Inputs (read them): task.md (what was asked) and profile.json (the data's structure).
 
-Break the task down yourself: cover every explicit ask in task.md (if it enumerates sub-questions, each must be represented) AND the higher-level narrative/insight the artifact should deliver.
+Break the task down yourself: focus on the core narrative/insight the artifact should deliver, rather than trying to blindly cover every secondary sub-question in task.md.
 
 Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Each question:
   - id: short snake_case id
@@ -77,41 +100,40 @@ Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Ea
   - expected_form: one of scalar | series | table | ranking | breakdown | interactive_dashboard
   - supports: which task requirement or narrative beat it serves
 
-A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns). However, do NOT pack multiple distinct queries or dimensions into every single question (e.g., asking for volume AND citations AND authors in one question). Instead, spread them out: 3-4 questions should be simple, highly targeted data aggregations (e.g., just "volume over time" or just "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights. This ensures downstream agents can reliably compute the data without crashing. Balance deep statistical insights with broad token-efficient exploration, envision the final artifact as a story dashboard. Ensure all data views remain meaningful and purposeful. 
-Organize the questions with this strict mechanical reality in mind: later, one agent has to compute the pandas logic then calculate answers for these questions, and another agent has to code the UI dashboard for them. Both operate under strict token budgets. If you create queries that are too complex, the downstream agents will crash and the question will remain entirely unanswered. Be safe and gentle. Prioritize the core narrative. It is better to have clean, working charts than to crash trying to cover every secondary metric. 
-Then call finish."""
+CRITICAL INSTRUCTIONS:
+- Aim for a strict bound of 5-6 questions. 
+- Envision the final artifact as a story dashboard. A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns). 
+- Balance deep statistical insights with broad token-efficient exploration. 3-4 questions should be simple, targeted data aggregations that explore the data and are fairly easy to compute (e.g., "volume over time" or "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights.
+- Ensure all data views remain meaningful and purposeful. Then call finish."""
 
-ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answer for a specific target question directly from the raw dataset. These numbers become the ground truth the visualization displays..
+ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answers for the analytical questions directly from the raw dataset. These numbers become the ground truth the visualization displays.
 
-Inputs: task.md, profile.json, and the TARGET QUESTION (provided in your prompt). Raw data is in data/.
+Inputs: task.md, profile.json, and questions.json. Raw data is in data/.
 
 Workflow:
-1. Read profile.json and understand your TARGET QUESTION.
-2. Write source/analyze_{id}.py that loads data/ and computes the answer for your assigned question id. Run it with bash; iterate until clean.
-3. Emit findings_{id}.json (at the workdir root): {"findings": [ {id, answer, data_profile, method, caveats} ]} where
-   - id: Must exactly match your assigned id
+1. Read profile.json (gives you the data schema and sample values) and questions.json.
+2. Write a single python script (source/analyze.py) that loads data/ ONCE, and then iterates through all the questions.
+3. For EACH question it processes, the script must compute the answer and independently emit a findings_{id}.json file (at the workdir root) with this exact structure: {"findings": [ {id, answer, data_profile, method, caveats} ]} where:
+   - id: Must exactly match the question id from questions.json
    - answer: concise plain-language answer
    - data_profile: A schema definition containing:
-        - "filepath": Local path where analyze_{id}.py saved the dataset (e.g., "outputs/{id}.csv" or "outputs/{id}.json"). Choose the best format for the data shape.
+        - "filepath": Local path where analyze.py saved the plot-ready dataset for this question (e.g., "outputs/{id}.csv"). Choose the best format for the data shape.
         - "format": "csv" or "json"
         - "schema": For tabular data, map columns to types. For graphs/nested data, describe the structure.
         - "sample": A minimal snippet (e.g., 2 rows, or 1 node/edge) showing exact structure.
    - method: one line on how it was computed
    - caveats: any data limitations (optional)
-4. Call finish.
+4. Run analyze.py with bash; iterate until all feasible questions are computed. Then call finish.
 
-
-CRITICAL INSTRUCTIONS: 
-- Your analyze_{id}.py script MUST save the calculated, plot-ready data to a file in the `outputs/` directory. NEVER inline full data arrays into findings_{id}.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically by analyze_{id}.py to guarantee accuracy. Do not copy the original question or rationale into findings_{id}.json; the system will merge those later.
-
-- Design the whole computation before writing code: which columns or edge types, which aggregations, what the output table looks like. Then write the script once, complete. Do not build it up interactively across several runs. Do not print or inspect the data to "understand it first". profile.json already gives you the schema and sample values. Go straight to computing the answer.
-
-- Here's your implementation ladder:
+CRITICAL INSTRUCTIONS:
+- File-Level Atomicity: Wrap the computation for EACH question inside its own `try/except` block and print the error traceback if it fails! This ensures that if question 2 crashes, your script will simply log it and continue on to successfully compute questions 3, 4, and 5 in the very first run. The `findings_{id}.json` files for the successful questions are safely saved to disk! When you retry your script, you can either skip the questions that already have findings files, or just fix the logic for question 2 and re-run. This gives you partial fault tolerance.
+- Your analyze.py script MUST save the calculated, plot-ready data to files in the `outputs/` directory. NEVER inline full data arrays into findings_{id}.json. NEVER print raw dataframes or large arrays to standard output. Use `.head(5)` or `.info()` if you must inspect data to preserve the token context window. The `data_profile` must be generated programmatically to guarantee accuracy. Do not copy the original question or rationale into findings_{id}.json.
+- Here's your implementation ladder for getting a script to work:
 Run 1: your full intended analysis.
-Run 2 (if errored): fix the error only — do not redesign.
-Run 3 (if errored): rewrite it the simplest way that works, answer one core question, dont have to answer everything at this point
+Run 2 (if errored): try to fix the error, without unnecessary redesign.
+Run 3 (if errored): rewrite the errored question the simplest way that works to answer one core point
 
-There is no run 4. If you are on your third execution, the answer you have is theanswer you ship: save findings_{id}.json and finish"""
+There is no run 4 for a single bug. If you are stuck on a specific question, comment it out, ensure the other questions save their findings successfully, and call finish."""
 
 STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
 
@@ -119,7 +141,7 @@ Inputs: task.md and viz_context.json (read them).
 
 Workflow:
 1. Read the inputs to understand what was asked and what findings were computed.
-2. Figure out the most coherent way to arrange these findings into a unified dashboard.
+2. Figure out the most coherent way to arrange these findings into a unified dashboard. Strictly follow data visualization best practices. 
 3. Write storyboard.json (at the workdir root): an object {"storyboard": { "hook": "...", "layout": [ ... ], "payoff": "..." }}.
    - hook: The overarching introductory narrative setting up the dashboard.
    - layout: An ordered array mapping the flow of the page. Each item dictates a section:
@@ -143,13 +165,12 @@ Build:
 - Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story. Render the specified finding IDs in the suggested `layout_hint` styles.
 - One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
 - For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
-- Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
+- Follow data visualization best practices. Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
-- Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast.
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
@@ -159,12 +180,31 @@ You are judged on these:
 - narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
 
 Validation Loop:
-When the page is written, you MUST call the `verify` tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
-If `verify` reports ANY `console_errors` or `page_errors`:
-1. CRITICAL: Use `str_replace` or `bash` (sed) to fix the bug. DO NOT use `write_file` to rewrite the entire script for minor edits. Rewriting entire files wastes output tokens and will cause you to fail.
-2. Re-run `build.py` via bash to generate the new dist/index.html.
-3. Call `verify` again.
-Iterate until `verify` passes with 0 errors and non-empty charts. Then call finish with a short summary of the panels."""
+You must verify the page programmatically using verify's `actions` parameter and the text fields it returns.
+
+When the page is written, call `verify` with DOM-check actions:
+  verify(actions=[
+    {"do": "count", "selector": ".js-plotly-plot"},
+    {"do": "count", "selector": "svg"},
+    {"do": "count", "selector": "button, select, [role=tab]"},
+    {"do": "text",  "selector": "h1, h2, h3"}
+  ])
+
+Check the response for:
+- console_errors / page_errors: any means broken JS — fix and re-verify.
+- count '.js-plotly-plot': 0 means no Plotly charts rendered (even if the
+  divs exist). Fix data binding / Plotly.newPlot calls.
+- count 'svg': 0 with expected charts means the library failed to draw.
+- count of interactive controls: 0 when you built controls means they are
+  missing from the DOM.
+- text of headings: confirms section titles rendered.
+
+If ANY check fails:
+1. Use `str_replace` or `bash` (sed) to fix the bug — do NOT rewrite the
+   entire build.py for minor edits.
+2. Re-run `build.py` via bash.
+3. Call `verify` again with the same actions.
+Iterate until verify passes with 0 errors and working charts. Then call finish with a short summary of the panels."""
 
 # ---------------------------------------------------------------------------
 # Orchestration
@@ -192,9 +232,9 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
         dict(
             name="analyst", system_prompt=ANALYST_SYSTEM,
-            user_prompt="", # Injected dynamically
+            user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json. Write and run a single source/analyze.py script to process all questions. For each question, save findings_{{id}}.json to the workdir. Iterate until all questions are answered or you hit a blocker you cannot pass.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=20, max_history_tokens=20_000, prune_keep=6,
+            model=pick_model("analyst"), max_steps=30, max_history_tokens=20_000, prune_keep=4,
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -206,7 +246,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=40, max_history_tokens=20_000, prune_keep=6,
+            model=pick_model("coder"), max_steps=40, max_history_tokens=20_000, prune_keep=4,
         ),
     ]
 
@@ -214,53 +254,11 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     results: list[StageResult] = []
     for spec in specs:
         if spec["name"] == "analyst":
-            (workdir / "findings.json").write_text(json.dumps({"findings": []}))
-            
-            q_file = workdir / "questions.json"
-            questions = []
-            if q_file.exists():
-                try:
-                    questions = json.loads(q_file.read_text()).get("questions", [])
-                except Exception:
-                    pass
-            
-            analyst_spent = 0
-            for q in questions:
-                if analyst_spent >= 200_000:
-                    break
-                    
-                qid = q.get("id", "unknown")
-                q_prompt = f"WORKDIR={wd}\nTARGET QUESTION:\n{json.dumps(q, indent=2)}\nRead task.md and profile.json. Write and run source/analyze_{qid}.py to emit findings_{qid}.json."
-                
-                sub_spec = dict(spec)
-                sub_spec["name"] = f"analyst_{qid}"
-                sub_spec["user_prompt"] = q_prompt
-                sub_spec["prune_keep"] = 2
-                sub_spec["max_history_tokens"] = 12_000
-                sub_spec["low_water"] = 5_000
-                
-                q_ceiling = min(30_000, 200_000 - analyst_spent, budget.remaining())
-                if q_ceiling <= 0:
-                    break
-                q_budget = BudgetTracker(ceiling=q_ceiling)
-                
-                r = _safe_run(ctx=ctx, client=client, budget=q_budget, **sub_spec)
-                results.append(r)
-                
-                spent_here = r.usage.get("total_tokens", 0)
-                analyst_spent += spent_here
-                budget.spent += spent_here
-                
-                if r.finished:
-                    f_file = workdir / f"findings_{qid}.json"
-                    if f_file.exists():
-                        try:
-                            f_data = json.loads(f_file.read_text())
-                            main_data = json.loads((workdir / "findings.json").read_text())
-                            main_data["findings"].extend(f_data.get("findings", []))
-                            (workdir / "findings.json").write_text(json.dumps(main_data, indent=2))
-                        except Exception:
-                            pass
+            a_ceiling = min(250_000, budget.remaining())
+            a_budget = BudgetTracker(ceiling=a_ceiling)
+            r = _safe_run(ctx=ctx, client=client, budget=a_budget, **spec)
+            budget.spent += r.usage.get("total_tokens", 0)
+            results.append(r)
             _safe_merge_context(workdir)
         else:
             results.append(_safe_run(ctx=ctx, client=client, budget=budget, **spec))
@@ -326,19 +324,34 @@ def _safe_merge_context(workdir: Path) -> None:
 
 
 def _merge_context(workdir: Path) -> None:
-    questions = json.loads((workdir / "questions.json").read_text(encoding="utf-8"))["questions"]
-    findings = json.loads((workdir / "findings.json").read_text(encoding="utf-8"))["findings"]
-    findings_dict = {f["id"]: f for f in findings if isinstance(f, dict) and f.get("id")}
+    q_file = workdir / "questions.json"
+    if not q_file.exists():
+        return
+        
+    questions = json.loads(q_file.read_text(encoding="utf-8")).get("questions", [])
 
     enriched = []
     for q in questions:
         if not isinstance(q, dict) or not q.get("id"):
             continue
-        if q["id"] not in findings_dict:
+            
+        qid = q["id"]
+        f_file = workdir / f"findings_{qid}.json"
+        
+        if not f_file.exists():
             continue
-        finding = findings_dict[q["id"]]
+            
+        try:
+            finding_data = json.loads(f_file.read_text(encoding="utf-8"))
+            findings_list = finding_data.get("findings", [])
+            if not findings_list:
+                continue
+            finding = findings_list[0]
+        except Exception:
+            continue
+            
         enriched.append({
-            "id": q["id"],
+            "id": qid,
             "question": q.get("question"),
             "rationale": q.get("rationale"),
             "expected_form": q.get("expected_form"),

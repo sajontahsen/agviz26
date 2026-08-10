@@ -21,6 +21,30 @@ def _clip(text: str, limit: int = _MAX_OUTPUT) -> str:
     return f"{text[:limit - 200]}\n... [truncated {len(text) - limit + 200} chars]"
 
 
+def _reason(exc: Exception) -> str:
+    """Drop Playwright's retry call log (~1.5k chars) — keep the reason."""
+    return str(exc).strip().splitlines()[0][:200]
+
+
+# Page prose only — inner_text('body') scrapes every SVG axis tick label too.
+_BODY_TEXT_JS = """() => {
+    const skip = new Set(['SVG', 'SCRIPT', 'STYLE', 'NOSCRIPT']);
+    const out = [];
+    const walk = (n) => {
+        for (const c of n.childNodes) {
+            if (c.nodeType === 3) {
+                const t = c.textContent.trim();
+                if (t) out.push(t);
+            } else if (c.nodeType === 1 && !skip.has(c.tagName.toUpperCase())) {
+                walk(c);
+            }
+        }
+    };
+    walk(document.body);
+    return out.join('\\n');
+}"""
+
+
 def _fn(name: str, desc: str, props: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {
         "type": "function",
@@ -130,10 +154,10 @@ def render(args: dict[str, Any], ctx: EvalContext) -> str:
         ctx._rendered = True
 
         title = page.title()
-        body_text = page.inner_text("body")[:2000]
+        body_text = page.evaluate(_BODY_TEXT_JS)[:2000]
 
         charts = page.evaluate("""() => {
-            const plotly = document.querySelectorAll('.plotly, .js-plotly-plot');
+            const plotly = document.querySelectorAll('.js-plotly-plot');
             const svgs = document.querySelectorAll('svg');
             const canvases = document.querySelectorAll('canvas');
             return {plotly: plotly.length, svg: svgs.length, canvas: canvases.length};
@@ -168,7 +192,7 @@ def render(args: dict[str, Any], ctx: EvalContext) -> str:
         parts.append(f"body_text:\n{body_text}")
         return _clip("\n".join(parts))
     except Exception as exc:
-        return f"render error: {exc}"
+        return f"render error: {_reason(exc)}"
 
 
 def interact(args: dict[str, Any], ctx: EvalContext) -> str:
@@ -209,7 +233,7 @@ def interact(args: dict[str, Any], ctx: EvalContext) -> str:
         errors = ctx.drain_errors()
         return f"{action} {selector!r}: ok\n{errors}\nelement_text: {el_text}"
     except Exception as exc:
-        return f"{action} {selector!r}: FAILED — {exc}"
+        return f"{action} {selector!r}: FAILED — {_reason(exc)}"
 
 
 def inspect(args: dict[str, Any], ctx: EvalContext) -> str:
@@ -236,13 +260,13 @@ def inspect(args: dict[str, Any], ctx: EvalContext) -> str:
                 tag = el.evaluate("el => el.tagName.toLowerCase()")
                 items.append(f"  [{i}] <{tag}> visible={visible} text={text!r}")
             except Exception as exc:
-                items.append(f"  [{i}] error: {exc}")
+                items.append(f"  [{i}] error: {_reason(exc)}")
 
         more = f"\n  ... +{count - max_show} more" if count > max_show else ""
         errors = ctx.drain_errors()
         return _clip(f"inspect {selector!r}: {count} matches\n" + "\n".join(items) + more + f"\n{errors}")
     except Exception as exc:
-        return f"inspect error: {exc}"
+        return f"inspect error: {_reason(exc)}"
 
 
 def screenshot(args: dict[str, Any], ctx: EvalContext) -> str:
@@ -258,7 +282,7 @@ def screenshot(args: dict[str, Any], ctx: EvalContext) -> str:
             path = ctx.take_screenshot(full_page=bool(args.get("full_page", False)))
         return f"screenshot saved: {path}"
     except Exception as exc:
-        return f"screenshot error: {exc}"
+        return f"screenshot error: {_reason(exc)}"
 
 
 # ---------------------------------------------------------------------------
