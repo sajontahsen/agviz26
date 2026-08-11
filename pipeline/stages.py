@@ -83,6 +83,7 @@ seen before — it MUST include:
   direction semantics, units, date formats, null encodings, id types.
 - entities: for every specific person/place/thing named in task.md, its resolved
   id and type.
+- If the ANLAYST would need to read additional metadata/documentation, note that in a relevant section
 
 Prefer pandas/networkx. Keep example lists short."""
 
@@ -90,21 +91,20 @@ PLANNER_SYSTEM = """You are a visualization PLANNING agent. You do NOT write cod
 
 Inputs (read them): task.md (what was asked) and profile.json (the data's structure).
 
-Break the task down yourself: focus on the core narrative/insight the artifact should deliver, rather than trying to blindly cover every secondary sub-question in task.md.
+INSTRUCTIONS:
+- Break the task down yourself: Design 5-6 questions that cover every explicit ask in task.md. Focus on the core narrative/insight the artifact should deliver, rather than trying to blindly cover every secondary sub-question in task.md.
+- Balance deep statistical insights with broad token-efficient exploration. 3-4 questions should be simple, targeted data aggregations that explore the data and are fairly easy to compute (e.g., "volume over time" or "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights.
+- Envision the final artifact as a story dashboard driven by interactive UI controls (like tabs or dropdowns). 
+- Ensure all data views remain meaningful and purposeful. Then call finish.
 
+Output:
 Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Each question:
   - id: short snake_case id
   - question: the analytical question in plain language
   - rationale: why it matters for the task and the story
   - computation_hint: concretely how to compute it from the data (which columns/edge-types/aggregation), grounded in profile.json field names
   - expected_form: one of scalar | series | table | ranking | breakdown | interactive_dashboard
-  - supports: which task requirement or narrative beat it serves
-
-CRITICAL INSTRUCTIONS:
-- Aim for a strict bound of 5-6 questions. 
-- Envision the final artifact as a story dashboard. A single "question" (e.g., expected_form: interactive_dashboard) can encompass multiple charts driven by interactive UI controls (like tabs or dropdowns). 
-- Balance deep statistical insights with broad token-efficient exploration. 3-4 questions should be simple, targeted data aggregations that explore the data and are fairly easy to compute (e.g., "volume over time" or "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights.
-- Ensure all data views remain meaningful and purposeful. Then call finish."""
+  - supports: which task requirement or narrative beat it serves"""
 
 ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answers for the analytical questions directly from the raw dataset. These numbers become the ground truth the visualization displays.
 
@@ -133,7 +133,8 @@ Run 1: your full intended analysis.
 Run 2 (if errored): try to fix the error, without unnecessary redesign.
 Run 3 (if errored): rewrite the errored question the simplest way that works to answer one core point
 
-There is no run 4 for a single bug. If you are stuck on a specific question, comment it out, ensure the other questions save their findings successfully, and call finish."""
+There is no run 4 for a single bug. If you are stuck on a specific question, comment it out, ensure the other questions save their findings successfully, and call finish.
+- Token Economy: Work economically — the job has a shared token budget."""
 
 STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
 
@@ -157,8 +158,8 @@ CODER_SYSTEM = """You are a web data-visualization engineer. Build ONE cohesive,
 
 Read these (workdir root):
 - task.md — what was asked.
-- viz_context.json — the visualizations to build, under "visualizations_to_build". Each item has: id, question, rationale, expected_form, answer, method, caveats, and a `data_profile` = {filepath, format, schema, sample}. The `data_profile` tells you where the plot-ready data lives and its exact structure. Use the exact fields shown in `schema`/`sample` — never rename or invent keys (mismatched keys silently break charts).
 - storyboard.json — the structural layout and narrative text (hook, layout, payoff).
+- viz_context.json — the visualizations to build, under "visualizations_to_build". Each item has: id, question, rationale, expected_form, answer, method, caveats, and a `data_profile` = {filepath, format, schema, sample}. The `data_profile` tells you where the plot-ready data lives and its exact structure. Use the exact fields shown in `schema`/`sample` — never rename or invent keys (mismatched keys silently break charts).
 
 Build:
 - Write source/build.py that reads each finding's data from its data_profile.filepath (relative to the workdir), embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
@@ -167,16 +168,19 @@ Build:
 - For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
 - Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
+- Follow data visualization best practices. For Plotly layout: always place legends below the chart area (`legend: {orientation:'h', y:-0.15}`), set adequate `margin: {t, b}` so titles and legends never overlap chart content.
+- For every chart, attach a `plotly_hover` listener that writes the hovered data point's details into a visible DOM element (e.g. a `<div class="detail-panel">`). This makes hover data accessible to automated evaluators that scan page text — do not rely solely on Plotly's native SVG tooltips.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
-- Token Economy: Work economically — the job has a shared token budget, and long transcripts spend it fast. 
+- Token Economy: Work economically — the job has a shared token budget. 
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
-- data_fidelity: numbers on screen match the actual data.
 - visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
+
+- data_fidelity: numbers on screen match the actual data.
 - insightfulness: call out trends, exceptions, comparisons — not just raw charts.
 - narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
 
@@ -205,7 +209,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="profile", system_prompt=PROFILE_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nProfile the dataset. Read task.md and data/, then write and run source/profile.py to emit profile.json.",
             tool_names=["read_file", "write_file", "str_replace", "bash"],
-            model=pick_model("profile"), max_steps=15,
+            model=pick_model("profile"), max_steps=15, 
         ),
         dict(
             name="planner", system_prompt=PLANNER_SYSTEM,
@@ -217,7 +221,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="analyst", system_prompt=ANALYST_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json. Write and run a single source/analyze.py script to process all questions. For each question, save findings_{{id}}.json to the workdir. Iterate until all questions are answered or you hit a blocker you cannot pass.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=50, max_history_tokens=20_000, prune_keep=4, low_water=15_000
+            model=pick_model("analyst"), max_steps=50, max_history_tokens=20_000, prune_keep=4, low_water=100_000
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -227,7 +231,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         ),
         dict(
             name="coder", system_prompt=CODER_SYSTEM,
-            user_prompt=f"WORKDIR={wd}\nRead task.md and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
+            user_prompt=f"WORKDIR={wd}\nRead task.md, storyboard.json and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
             model=pick_model("coder"), max_steps=80, max_history_tokens=20_000, prune_keep=4,
         ),
@@ -237,7 +241,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     results: list[StageResult] = []
     for spec in specs:
         if spec["name"] == "analyst":
-            a_ceiling = min(250_000, budget.remaining())
+            a_ceiling = min(300_000, budget.remaining())
             a_budget = BudgetTracker(ceiling=a_ceiling)
             r = _safe_run(ctx=ctx, client=client, budget=a_budget, **spec)
             budget.spent += r.usage.get("total_tokens", 0)
@@ -337,7 +341,7 @@ def _merge_context(workdir: Path) -> None:
             "id": qid,
             "question": q.get("question"),
             "rationale": q.get("rationale"),
-            "expected_form": q.get("expected_form"),
+            # "expected_form": q.get("expected_form"),
             "answer": finding.get("answer"),
             "data_profile": finding.get("data_profile"),
             "method": finding.get("method"),
@@ -345,7 +349,7 @@ def _merge_context(workdir: Path) -> None:
         })
 
     (workdir / "viz_context.json").write_text(
-        json.dumps({"visualizations_to_build": enriched}, indent=2) + "\n", encoding="utf-8")
+        json.dumps({"visualization_context": enriched}, indent=2) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
