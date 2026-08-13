@@ -95,16 +95,18 @@ def run_stage(
             if not warned_budget and budget.remaining() < low_water:
                 warned_budget = True
                 messages.append({"role": "user", "content": (
-                    f"Your token budget is nearly exhausted. Stop exploring now: "
-                    "save the best artifact you can, and finish immediately."
+                    "Your token budget is nearly exhausted. "
+                    "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
+                    "Finalize the working parts and ship now."
                 )})
                 
-        if not warned_steps and step >= max_steps - 3:
-            warned_steps = True
-            messages.append({"role": "user", "content": (
-                f"You are approaching the maximum number of steps (ie steps of the llm messaging loop) allowed for this stage (2 steps left). Stop exploring now: "
-                "save the best artifact you can, and finish immediately."
-            )})
+            if not warned_steps and step >= max_steps - 3:
+                warned_steps = True
+                messages.append({"role": "user", "content": (
+                    "Only 2 steps remaining. "
+                    "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
+                    "Finalize the working parts and ship now."
+                )})
 
         message = client.create(
             model=model,

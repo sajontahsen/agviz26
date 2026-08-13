@@ -92,9 +92,9 @@ PLANNER_SYSTEM = """You are a visualization PLANNING agent. You do NOT write cod
 Inputs (read them): task.md (what was asked) and profile.json (the data's structure).
 
 INSTRUCTIONS:
-- Break the task down yourself: Design 5-6 questions that cover every explicit ask in task.md. Focus on the core narrative/insight the artifact should deliver, rather than trying to blindly cover every secondary sub-question in task.md.
-- Balance deep statistical insights with broad token-efficient exploration. 3-4 questions should be simple, targeted data aggregations that explore the data and are fairly easy to compute (e.g., "volume over time" or "top 10 authors"), while 1-2 can be more multifaceted to provide deep insights.
-- Envision the final artifact as a story dashboard driven by interactive UI controls (like tabs or dropdowns). 
+- Output questions from the task that the analyst will then code for to answer from the data.
+- If the task has explicit asks, prioritize questions that answer the core narrative. If there are many secondary sub-questions, drop them to keep the scope manageable. If the task is open-ended, extrapolate strictly 5-6 questions. 
+- The questions MUST be strictly atomic. Downstream agents operate under strict token budgets; if you pack multiple dimensions into a single question, the pipeline will crash.
 - Ensure all data views remain meaningful and purposeful. Then call finish.
 
 Output:
@@ -103,7 +103,6 @@ Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Ea
   - question: the analytical question in plain language
   - rationale: why it matters for the task and the story
   - computation_hint: concretely how to compute it from the data (which columns/edge-types/aggregation), grounded in profile.json field names
-  - expected_form: one of scalar | series | table | ranking | breakdown | interactive_dashboard
   - supports: which task requirement or narrative beat it serves"""
 
 ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answers for the analytical questions directly from the raw dataset. These numbers become the ground truth the visualization displays.
@@ -136,7 +135,7 @@ Run 3 (if errored): rewrite the errored question the simplest way that works to 
 There is no run 4 for a single bug. If you are stuck on a specific question, comment it out, ensure the other questions save their findings successfully, and call finish.
 - Token Economy: Work economically — the job has a shared token budget."""
 
-STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You design the structural flow and narrative of the final dashboard.
+STORYBOARD_SYSTEM = """You are a STORYBOARD & LAYOUT agent. You do NOT write code and you do NOT compute answers. You design the structural flow, narrative, and exact visualization specifications for the final dashboard.
 
 Inputs: task.md and viz_context.json (read them).
 
@@ -147,29 +146,34 @@ Workflow:
    - hook: The overarching introductory narrative setting up the dashboard.
    - layout: An ordered array mapping the flow of the page. Each item dictates a section:
      - ids: Array of finding IDs to include in this section.
-     - layout_hint: How to render it (e.g., "full-width interactive dashboard with tabs", "side-by-side static comparison", "single focused chart").
+     - visualization_specs: A detailed specification for EACH id in this section telling the coder exactly how to plot the data. For each id, define:
+         - chart_type: exact chart to use (e.g., "stacked bar chart", "line chart", "scatter plot", "data table", etc).
+         - data_mapping: explicit instructions on what JSON fields map to the X axis, Y axis, groupings, or tooltips.
+         - interactivity: explicit instructions for UI controls (e.g., "add a dropdown to filter by region", or "static").
+     - layout_hint: How to arrange the charts in this section structurally (e.g., "side-by-side comparison", "full-width").
      - narrative_build: The transitional text explaining this section and guiding the user.
    - payoff: The concluding actionable takeaways or insights.
 4. Call finish.
 
-Keep the narrative tight, professional, and directly tied to the actual computed findings."""
+Keep the narrative tight, professional, and directly tied to the actual computed findings. Do not leave visualization choices up to the downstream coder; dictate exactly what charts to build and how to map the data."""
 
 CODER_SYSTEM = """You are a web data-visualization engineer. Build ONE cohesive, self-contained, interactive artifact at dist/index.html that tells a clear story and lets a reviewer inspect the answers to the task.
 
 Read these (workdir root):
 - task.md — what was asked.
-- storyboard.json — the structural layout and narrative text (hook, layout, payoff).
-- viz_context.json — the visualizations to build, under "visualizations_to_build". Each item has: id, question, rationale, expected_form, answer, method, caveats, and a `data_profile` = {filepath, format, schema, sample}. The `data_profile` tells you where the plot-ready data lives and its exact structure. Use the exact fields shown in `schema`/`sample` — never rename or invent keys (mismatched keys silently break charts).
+- storyboard.json — the structural layout, narrative text, and visualization specifications.
+- viz_context.json — The computed ground-truth data you must visualize. Contains a `visualizations_to_build` array. Each item provides:
+    - `id`: The unique identifier (matches the ids in storyboard.json).
+    - `answer`: The analytical conclusion that this specific chart must prove.
+    - `data_profile`: A dictionary ({filepath, format, schema, sample}) telling you exactly where the plot-ready data is saved on disk. Use the exact field names shown in the `sample` — never rename or invent keys, or the charts will silently break.
 
 Build:
-- Write source/build.py that reads each finding's data from its data_profile.filepath (relative to the workdir), embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
-- Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story. Render the specified finding IDs in the suggested `layout_hint` styles.
-- One panel per relevant finding, chart type matched to its expected_form / schema. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
-- For `expected_form: interactive_dashboard` or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
-- Apply a premium, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
+- Write source/build.py that reads each finding's data from its data_profile.filepath, embeds what it needs inline as JSON (use `json.dumps()` to safely inject into `<script>` tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
+- Strictly follow the structural flow defined in the `layout` array of storyboard.json. Weave the `hook`, `narrative_build`, and `payoff` text directly into the HTML to create a coherent story.
+- Follow the `visualization_specs` defined in storyboard.json exactly. Do not make up your own visualization mappings. Map the JSON fields exactly as instructed to the correct axes and chart types. Display the computed numbers as-is. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
+- For interactive elements or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
+- Apply a cohesive, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
-- Follow data visualization best practices. For Plotly layout: always place legends below the chart area (`legend: {orientation:'h', y:-0.15}`), set adequate `margin: {t, b}` so titles and legends never overlap chart content.
-- For every chart, attach a `plotly_hover` listener that writes the hovered data point's details into a visible DOM element (e.g. a `<div class="detail-panel">`). This makes hover data accessible to automated evaluators that scan page text — do not rely solely on Plotly's native SVG tooltips.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - Never render tens of thousands of nodes raw.
@@ -179,7 +183,6 @@ Build:
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
 - visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
-
 - data_fidelity: numbers on screen match the actual data.
 - insightfulness: call out trends, exceptions, comparisons — not just raw charts.
 - narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
@@ -221,7 +224,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="analyst", system_prompt=ANALYST_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json. Write and run a single source/analyze.py script to process all questions. For each question, save findings_{{id}}.json to the workdir. Iterate until all questions are answered or you hit a blocker you cannot pass.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=50, max_history_tokens=20_000, prune_keep=4, low_water=100_000
+            model=pick_model("analyst"), max_steps=50, max_history_tokens=8_000, prune_keep=4, low_water=100_000
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -233,7 +236,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, storyboard.json and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=80, max_history_tokens=20_000, prune_keep=4,
+            model=pick_model("coder"), max_steps=80, max_history_tokens=8_000, prune_keep=4,
         ),
     ]
 
