@@ -85,75 +85,81 @@ def run_stage(
     warned_budget = False
     warned_steps = False
 
-    for step in range(1, max_steps + 1):
-        # Budget gate: stop before making a call that would overrun the shared
-        # generation ceiling; nudge the model to finalize as it nears the limit.
-        if budget is not None:
-            if budget.exhausted():
-                _log(name, f"budget ceiling hit (spent={budget.spent}); stopping at step {step}")
-                return StageResult(name, {}, usage, step - 1, finished=False, tool_counts=tool_counts)
-            if not warned_budget and budget.remaining() < low_water:
-                warned_budget = True
-                messages.append({"role": "user", "content": (
-                    "Your token budget is nearly exhausted. "
-                    "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
-                    "Finalize the working parts and ship now."
-                )})
-                
-            if not warned_steps and step >= max_steps - 3:
-                warned_steps = True
-                messages.append({"role": "user", "content": (
-                    "Only 2 steps remaining. "
-                    "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
-                    "Finalize the working parts and ship now."
-                )})
-
-        message = client.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            max_tokens=max_tokens,
-        )
-        _accumulate(usage, getattr(client, "last_usage", {}))
-        if budget is not None:
-            budget.add(getattr(client, "last_usage", {}))
-        messages.append(message)
-
-        calls = message.get("tool_calls") or []
-        if not calls:
-            idle_nudges += 1
-            if idle_nudges >= 3:
-                _log(name, f"no tool call twice; ending stage at step {step}")
-                return StageResult(name, {}, usage, step, finished=False, tool_counts=tool_counts)
-            messages.append({"role": "user", "content": "No tool calls made indicates stalling. Use the tools to make progress, eg write the script then run it with bash. Once the task is done, call finish with a short JSON summary."})
-            _prune(messages, max_history_tokens, prune_keep)
-            continue
-        idle_nudges = 0
-
-        for call in calls:
-            fn = call.get("function") or {}
-            fname = fn.get("name")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError as exc:
-                messages.append(_tool_msg(call, f"Tool argument JSON error: {exc}"))
+    try:
+        for step in range(1, max_steps + 1):
+            # Budget gate: stop before making a call that would overrun the shared
+            # generation ceiling; nudge the model to finalize as it nears the limit.
+            if budget is not None:
+                if budget.exhausted():
+                    _log(name, f"budget ceiling hit (spent={budget.spent}); stopping at step {step}")
+                    return StageResult(name, {}, usage, step - 1, finished=False, tool_counts=tool_counts)
+                if not warned_budget and budget.remaining() < low_water:
+                    warned_budget = True
+                    messages.append({"role": "user", "content": (
+                        "Your token budget is nearly exhausted. "
+                        "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
+                        "Finalize the working parts and ship now."
+                    )})
+                    
+                if not warned_steps and step >= max_steps - 3:
+                    warned_steps = True
+                    messages.append({"role": "user", "content": (
+                        "Only 2 steps remaining. "
+                        "Do NOT explore/debug any further. Remove or disable any broken features immediately. "
+                        "Finalize the working parts and ship now."
+                    )})
+    
+            message = client.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=max_tokens,
+            )
+            _accumulate(usage, getattr(client, "last_usage", {}))
+            if budget is not None:
+                budget.add(getattr(client, "last_usage", {}))
+            messages.append(message)
+    
+            calls = message.get("tool_calls") or []
+            if not calls:
+                idle_nudges += 1
+                if idle_nudges >= 3:
+                    _log(name, f"no tool call twice; ending stage at step {step}")
+                    return StageResult(name, {}, usage, step, finished=False, tool_counts=tool_counts)
+                messages.append({"role": "user", "content": "No tool calls made indicates stalling. Use the tools to make progress, eg write the script then run it with bash. Once the task is done, call finish with a short JSON summary."})
+                _prune(messages, max_history_tokens, prune_keep)
+                continue
+            idle_nudges = 0
+    
+            for call in calls:
+                fn = call.get("function") or {}
+                fname = fn.get("name")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError as exc:
+                    messages.append(_tool_msg(call, f"Tool argument JSON error: {exc}"))
+                    if fname:
+                        tool_counts[fname] = tool_counts.get(fname, 0) + 1
+                    continue
                 if fname:
                     tool_counts[fname] = tool_counts.get(fname, 0) + 1
-                continue
-            if fname:
-                tool_counts[fname] = tool_counts.get(fname, 0) + 1
-            if fname == "finish":
-                _log(name, f"finished at step {step}; tokens={usage['total_tokens']} tools={tool_counts}")
-                return StageResult(name, args.get("result") or {}, usage, step, finished=True, tool_counts=tool_counts)
-            executor = execs.get(fname)
-            output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
-            messages.append(_tool_msg(call, output))
-
-        _prune(messages, max_history_tokens, prune_keep)
-
-    _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']} tools={tool_counts}")
-    return StageResult(name, {}, usage, max_steps, finished=False, tool_counts=tool_counts)
+                if fname == "finish":
+                    _log(name, f"finished at step {step}; tokens={usage['total_tokens']} tools={tool_counts}")
+                    return StageResult(name, args.get("result") or {}, usage, step, finished=True, tool_counts=tool_counts)
+                executor = execs.get(fname)
+                output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
+                messages.append(_tool_msg(call, output))
+    
+            _prune(messages, max_history_tokens, prune_keep)
+    
+        _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']} tools={tool_counts}")
+        return StageResult(name, {}, usage, max_steps, finished=False, tool_counts=tool_counts)
+    finally:
+        try:
+            (ctx.tool_root / f"messages_{name}.json").write_text(json.dumps(messages, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _log(name, f"failed to write messages: {exc}")
 
 
 # ---------------------------------------------------------------------------

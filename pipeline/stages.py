@@ -91,19 +91,18 @@ PLANNER_SYSTEM = """You are a visualization PLANNING agent. You do NOT write cod
 
 Inputs (read them): task.md (what was asked) and profile.json (the data's structure).
 
-INSTRUCTIONS:
-- Output questions from the task that the analyst will then code for to answer from the data.
-- If the task has explicit asks, prioritize questions that answer the core narrative. If there are many secondary sub-questions, drop them to keep the scope manageable. If the task is open-ended, extrapolate strictly 5-6 questions. 
-- The questions MUST be strictly atomic. Downstream agents operate under strict token budgets; if you pack multiple dimensions into a single question, the pipeline will crash.
-- Ensure all data views remain meaningful and purposeful. Then call finish.
-
 Output:
 Write questions.json (at the workdir root): an object {"questions": [ ... ]}. Each question:
   - id: short snake_case id
   - question: the analytical question in plain language
   - rationale: why it matters for the task and the story
   - computation_hint: concretely how to compute it from the data (which columns/edge-types/aggregation), grounded in profile.json field names
-  - supports: which task requirement or narrative beat it serves"""
+  - supports: which task requirement or narrative beat it serves
+  
+CRITICAL INSTRUCTIONS:
+- Prioritize questions that answer the core tasks. If there are many secondary sub-tasks, drop them to keep the scope manageable. If the task is open-ended, extrapolate strictly 5-6 questions. 
+- The questions MUST be strictly atomic. Downstream agents operate under strict token budgets; if you pack multiple dimensions into a single question, the pipeline will crash.
+- Ensure all data views remain meaningful and purposeful. Then call finish."""
 
 ANALYST_SYSTEM = """You are a data ANALYST agent. Compute the correct, verified answers for the analytical questions directly from the raw dataset. These numbers become the ground truth the visualization displays.
 
@@ -224,7 +223,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="analyst", system_prompt=ANALYST_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, profile.json, and questions.json. Write and run a single source/analyze.py script to process all questions. For each question, save findings_{{id}}.json to the workdir. Iterate until all questions are answered or you hit a blocker you cannot pass.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
-            model=pick_model("analyst"), max_steps=50, max_history_tokens=8_000, prune_keep=4, low_water=100_000
+            model=pick_model("analyst"), max_steps=50, max_history_tokens=8_000, prune_keep=16, low_water=100_000
         ),
         dict(
             name="storyboard", system_prompt=STORYBOARD_SYSTEM,
@@ -236,7 +235,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             name="coder", system_prompt=CODER_SYSTEM,
             user_prompt=f"WORKDIR={wd}\nRead task.md, storyboard.json and viz_context.json, then write and run source/build.py to produce dist/index.html. Verify it renders before finishing.",
             tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-            model=pick_model("coder"), max_steps=80, max_history_tokens=8_000, prune_keep=4,
+            model=pick_model("coder"), max_steps=80, max_history_tokens=8_000,
         ),
     ]
 
