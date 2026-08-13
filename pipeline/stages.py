@@ -24,6 +24,7 @@ GEN_TOKEN_CEILING = 800_000
 
 CLOUD_SONNET = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 CLOUD_OPUS = "global.anthropic.claude-opus-4-8"
+KIMI_K_2_5 = "moonshotai.kimi-k2.5"
 LOCAL_MODEL = os.environ.get("VIS_ARENA_LOCAL_MODEL", "gpt-5-nano")
 
 _CLOUD_ROLES = {
@@ -31,7 +32,7 @@ _CLOUD_ROLES = {
     "planner": CLOUD_OPUS,
     "analyst": CLOUD_OPUS,
     "storyboard": CLOUD_OPUS,
-    "coder": CLOUD_OPUS,
+    "coder": KIMI_K_2_5,
 }
 
 
@@ -439,6 +440,8 @@ def _cleanup_state_files(workdir: Path) -> None:
     
     files_to_move = ["profile.json", "questions.json", "findings.json", "viz_context.json", "storyboard.json"]
     for f in workdir.glob("findings_*.json"):
+        files_to_move.append(f.name)
+    for f in workdir.glob("messages_*.json"):
         files_to_move.append(f.name)
         
     for fname in files_to_move:
