@@ -86,13 +86,16 @@ def write_file(args: dict[str, Any], ctx: ToolContext) -> str:
     content = args.get("content")
     if content is None:
         return "Error: write_file requires 'content'."
+    append = bool(args.get("append"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        with path.open("a" if append else "w", encoding="utf-8") as f:
+            f.write(content)
     except OSError as exc:
         return f"Error writing {path}: {exc}"
-    n_lines = content.count("\n") + 1
-    return f"Wrote {path} ({len(content)} bytes, {n_lines} lines)."
+    size = path.stat().st_size
+    verb = "Appended" if append else "Wrote"
+    return f"{verb} {len(content)} chars to {path} (now {size} bytes)."
 
 
 def str_replace(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -403,10 +406,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "write_file": _fn(
         "write_file",
-        "Create or overwrite a file with exact content. Prefer this over bash heredocs.",
+        "Write text to a file. Use append=true to build a large file across several calls "
+        "instead of rewriting it. Prefer this over bash heredocs.",
         {
             "path": {"type": "string"},
             "content": {"type": "string"},
+            "append": {"type": "boolean", "description": "Append instead of overwrite. Default false."},
         },
         ["path", "content"],
     ),

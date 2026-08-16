@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .tools import ToolContext, build_toolset
@@ -18,10 +19,8 @@ _FINISH_SCHEMA = {
     },
 }
 
-_ELIDED = "[older tool output elided to save context]"
-# Argument keys whose values can be large (file/edit/script payloads).
 _HEAVY_ARG_KEYS = ("content", "new_str", "old_str", "script")
-_HEAVY_ARG_THRESHOLD = 200  # chars; below this, leave the value alone
+_STALE_PREVIEW = 240
 
 
 @dataclass
@@ -64,8 +63,8 @@ def run_stage(
     tool_executors: dict[str, Any] | None = None,
     purpose: str = "generation",
     max_steps: int = 24,
-    max_history_tokens: int = 40_000,
-    prune_keep: int | None = None,
+    max_history_tokens: int = 40_000, # no longer used in compaction strategy
+    prune_keep: int = 12,
     max_tokens: int = 8192,
     budget: BudgetTracker | None = None,
     low_water: int = 60_000,
@@ -111,7 +110,7 @@ def run_stage(
     
             message = client.create(
                 model=model,
-                messages=messages,
+                messages=_compact(messages, prune_keep),
                 tools=tools,
                 tool_choice="auto",
                 max_tokens=max_tokens,
@@ -128,7 +127,6 @@ def run_stage(
                     _log(name, f"no tool call twice; ending stage at step {step}")
                     return StageResult(name, {}, usage, step, finished=False, tool_counts=tool_counts)
                 messages.append({"role": "user", "content": "No tool calls made indicates stalling. Use the tools to make progress, eg write the script then run it with bash. Once the task is done, call finish with a short JSON summary."})
-                _prune(messages, max_history_tokens, prune_keep)
                 continue
             idle_nudges = 0
     
@@ -151,15 +149,15 @@ def run_stage(
                 output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
                 messages.append(_tool_msg(call, output))
     
-            _prune(messages, max_history_tokens, prune_keep)
-    
         _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']} tools={tool_counts}")
         return StageResult(name, {}, usage, max_steps, finished=False, tool_counts=tool_counts)
     finally:
-        try:
-            (ctx.tool_root / f"messages_{name}.json").write_text(json.dumps(messages, indent=2), encoding="utf-8")
-        except Exception as exc:
-            _log(name, f"failed to write messages: {exc}")
+        root = getattr(ctx, "tool_root", None) or getattr(ctx, "workdir", None)
+        if root:
+            try:
+                (Path(root) / f"messages_{name}.json").write_text(json.dumps(messages, indent=2), encoding="utf-8")
+            except Exception as exc:
+                _log(name, f"failed to write messages: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -175,45 +173,33 @@ def _accumulate(total: dict[str, int], last: dict[str, Any]) -> None:
         total[k] += int(last.get(k, 0) or 0)
 
 
-def _prune(messages: list[dict[str, Any]], max_history_tokens: int, prune_keep: int | None = None) -> None:
-    """Elide tool results and assistant tool-call payloads by turn count and/or token estimation. Idempotent."""
-    # 1. Prune by hard turn count if specified
-    if prune_keep is not None:
-        tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        if len(tool_idxs) > prune_keep:
-            cutoff = tool_idxs[-prune_keep]
-            for i in range(2, cutoff):
-                m = messages[i]
-                role = m.get("role")
-                if role == "tool":
-                    if m.get("content") != _ELIDED:
-                        messages[i] = {**m, "content": _ELIDED}
-                elif role == "assistant" and m.get("tool_calls"):
-                    messages[i] = _shrink_assistant(m)
-
-    # 2. Prune by estimated token size
-    def _est_tokens(msgs: list[dict[str, Any]]) -> int:
-        return sum(len(str(m)) // 4 for m in msgs)
-    
-    if _est_tokens(messages) <= max_history_tokens:
-        return
-
-    # Skip 0 and 1 (system and first user prompt)
+def _compact(messages: list[dict[str, Any]], prune_keep: int) -> list[dict[str, Any]]:
+    """Return a compacted copy for sending to the LLM."""
+    if len(messages) <= prune_keep + 2:
+        return messages
+    tail_start = len(messages) - prune_keep
+    compacted: list[dict[str, Any]] = list(messages[:2])
     for i in range(2, len(messages)):
-        if _est_tokens(messages) <= max_history_tokens:
-            break
-            
-        m = messages[i]
-        role = m.get("role")
+        msg = messages[i]
+        if i >= tail_start:
+            compacted.append(msg)
+            continue
+        role = msg.get("role")
         if role == "tool":
-            if m.get("content") != _ELIDED:
-                messages[i] = {**m, "content": _ELIDED}
-        elif role == "assistant" and m.get("tool_calls"):
-            messages[i] = _shrink_assistant(m)
+            content = msg.get("content") or ""
+            if len(content) > _STALE_PREVIEW:
+                compacted.append({**msg, "content": content[:_STALE_PREVIEW] + f"\n... [{len(content)} chars, trimmed]"})
+            else:
+                compacted.append(msg)
+        elif role == "assistant" and msg.get("tool_calls"):
+            compacted.append(_shrink_assistant(msg))
+        else:
+            compacted.append(msg)
+    return compacted
 
 
 def _shrink_assistant(msg: dict[str, Any]) -> dict[str, Any]:
-    """Return msg with heavy tool-call argument payloads elided (or unchanged)."""
+    """Return msg with heavy tool-call argument payloads preview-truncated."""
     changed = False
     new_calls = []
     for call in msg.get("tool_calls") or []:
@@ -227,17 +213,18 @@ def _shrink_assistant(msg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _shrink_args(raw: str) -> tuple[str, bool]:
-    """Elide large string values in a tool-call arguments JSON string."""
+    """Truncate large string values in a tool-call arguments JSON, keeping a preview."""
     try:
         args = json.loads(raw or "{}")
     except json.JSONDecodeError:
-        # Unparseable but possibly huge — stub it if long.
-        return ('{"_elided": true}', True) if len(raw) > 400 else (raw, False)
+        if len(raw) > _STALE_PREVIEW:
+            return (raw[:_STALE_PREVIEW] + f"... [{len(raw)} chars, trimmed]", True)
+        return (raw, False)
     changed = False
     for k in _HEAVY_ARG_KEYS:
         v = args.get(k)
-        if isinstance(v, str) and len(v) > _HEAVY_ARG_THRESHOLD:
-            args[k] = f"[elided {len(v)} chars]"
+        if isinstance(v, str) and len(v) > _STALE_PREVIEW:
+            args[k] = v[:_STALE_PREVIEW] + f"... [{len(v)} chars, trimmed]"
             changed = True
     return (json.dumps(args), True) if changed else (raw, False)
 

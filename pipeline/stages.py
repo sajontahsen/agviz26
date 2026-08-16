@@ -32,7 +32,7 @@ _CLOUD_ROLES = {
     "planner": CLOUD_OPUS,
     "analyst": CLOUD_OPUS,
     "storyboard": CLOUD_OPUS,
-    "coder": KIMI_K_2_5,
+    "coder": CLOUD_OPUS,
 }
 
 
@@ -178,7 +178,11 @@ Build:
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server;
-- Token Economy: Work economically — the job has a shared token budget. 
+- Token Economy: Work economically — the job has a shared token budget.
+- Output limit: Each response is capped at ~8192 tokens. If a file is too large
+  for a single write_file call, write the first chunk with append=false, then
+  continue with append=true for each following chunk. For small edits to an
+  existing file, use str_replace instead of rewriting.
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
