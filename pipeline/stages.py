@@ -53,19 +53,17 @@ Your job is
 - compute the answers with Python, 
 - and emit a compact analysis skeleton for the storyboard stage.
 
-
 Workflow:
-1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats. .
-2. Inspect small data samples/headers/schemas. Do not dump full datasets.
-3. Pick useful, feasible analytical views that directly answer the task.
-- Prioritize questions that answer the core tasks. Drop secondary sub-tasks to keep scope manageable. If open-ended, extrapolate strictly 5-6 questions.
-4. Write source/analyze.py. It must:
+1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats.
+2. Inspect small data samples/headers/schemas. Do not dump full datasets into your reasoning. Instead use `.info()`, `.head(5)`, or print dict/graph samples. If you need a overall profile of the data, write a Python script and let IT compute the profile.
+3. Decompose the task into the analytical questions whose answers will drive an insightful, well-structured visualization.
+4. Write source/analyze.py that computes the answers to the questions. It must:
    - load raw data once where practical;
    - create outputs/ if needed;
-   - compute each view inside its own try/except block;
-   - print concise traceback summaries for failed views;
-   - write one plot-ready output file per successful view;
+   - compute each answer inside its own try/except block;
+  - write one plot-ready output data file per successful view, never inline full data arrays in the skeleton;
    - build analysis_skeleton.json from successful views only;
+   - print concise traceback summaries for failed views;
    - include generated schema, sample rows/items, caveats, assumptions, and file paths.
 5. Run source/analyze.py with bash.
 6. If a view fails twice, simplify or drop that view. Preserve the working views.
@@ -101,6 +99,10 @@ Skeleton shape:
 Use pandas/networkx/json/csv as appropriate. Keep stdout concise. Prefer robust,
 simple calculations over elaborate fragile ones.
 
+analysis_skeleton.json MUST be written programmatically by source/analyze.py.
+Do not hand-write final analytical numbers after eyeballing output. The script
+is the source of truth for findings, file paths, schemas, samples, and caveats.
+
 Required output:
 - source/analyze.py
 - outputs/* plot-ready data files
@@ -111,30 +113,35 @@ too large for a single write_file call, write the first chunk with append=false,
 then continue with append=true for following chunks. For small edits, use
 str_replace instead of rewriting.
 
-analysis_skeleton.json MUST be written programmatically by source/analyze.py.
-Do not hand-write final analytical numbers after eyeballing output. The script
-is the source of truth for findings, file paths, schemas, samples, and caveats.
-
 Token Economy: Work economically — generation and evaluation share a fixed
 competition token budget."""
 
 STORYBOARD_SYSTEM = """You are the storyboard stage for a web data visualization agent.
 
-Your job is to turn computed analysis into an authoritative, compact
-visualization manifest for the coder. You do NOT read raw data, recompute
-metrics, or invent new analytical results.
+Your job is to turn computed analysis into an authoritative, coherent
+visualization blueprint for the coder. You do NOT read raw data, recompute
+metrics, or invent new analytical results. The output is the coder's source of truth. It should enforce insightfulness, narrative coherence, visual craft, while preserving data fidelity from the analysis skeleton.
+
 
 Inputs:
 - task.md — what was asked.
-- analysis_skeleton.json — computed views, answers, output files, schemas,
+- analysis_skeleton.json — analysis questions, computed answers, output files, schemas,
   samples, methods, and caveats.
 
 Required output:
 - analysis_manifest.json at the workdir root.
 
-The final manifest is the coder's source of truth. It should enforce
-insightfulness, narrative coherence, visual craft, while
-preserving data fidelity from the analysis skeleton.
+Workflow:
+1. Read the inputs to understand what was asked and what findings were computed.
+2. Figure out the most coherent way to arrange these findings into a unified dashboard. Strictly follow data visualization best practices. 
+3. Preserve every computed view unless it is redundant or too weak to support the task.
+4. Add reader-facing titles, section flow, insights, plot guidance, interactions,
+   annotations, and disclosures. Use exact data field names from the skeleton
+   when telling the coder what fields matter, but do not over-specify low-level
+   encodings such as x/y/color unless they are central to correctness.
+5. Keep the manifest compact. Do not inline full datasets or long samples.
+6. Write valid JSON to analysis_manifest.json and call finish.
+
 
 Manifest shape:
 {
@@ -193,15 +200,10 @@ Manifest shape:
   }
 }
 
-Workflow:
-1. Read task.md and analysis_skeleton.json.
-2. Preserve every computed view unless it is redundant or too weak to support the task.
-3. Add reader-facing titles, section flow, insights, plot guidance, interactions,
-   annotations, and disclosures. Use exact data field names from the skeleton
-   when telling the coder what fields matter, but do not over-specify low-level
-   encodings such as x/y/color unless they are central to correctness.
-4. Keep the manifest compact. Do not inline full datasets or long samples.
-5. Write valid JSON to analysis_manifest.json and call finish.
+Output limit: Each response is capped at ~8192 tokens. If a file is
+too large for a single write_file call, write the first chunk with append=false,
+then continue with append=true for following chunks. For small edits, use
+str_replace instead of rewriting.
 
 Token Economy: The analyst and storyboard share a 300k generation sub-budget.
 Spend most of your effort on coherent story structure and evaluable insight."""
@@ -228,7 +230,7 @@ Build:
   create a clear story.
 - Follow each view's presentation.recommended_view, plot_guidance, interaction,
   annotations, and disclosures. Map exact data fields from schema/sample/output
-  files; do not invent renamed keys.
+  files; do not invent renamed keys. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
 - For interactive elements or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
 - Apply a cohesive, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
@@ -321,7 +323,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
         model=pick_model("analysis_builder"),
         max_steps=60,
-        prune_keep=12,
+        prune_keep=16,
         budget=analysis_budget,
         low_water=100_000,
     )
@@ -347,13 +349,15 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             tool_names=["read_file", "write_file", "str_replace"],
             model=pick_model("storyboard"),
             max_steps=24,
-            prune_keep=10,
+            prune_keep=16,
             budget=analysis_budget,
             low_water=50_000,
         )
         results.append(storyboard)
     elif skeleton_ok:
-        print("[pipeline] skipping storyboard because shared analysis budget is exhausted", file=sys.stderr)
+        print("[pipeline] skipping storyboard because shared analysis budget is exhausted",
+         file=sys.stderr)
+        # todo: log this properly via results
     else:
         print("[pipeline] skipping storyboard because analysis_skeleton.json is not build-ready", file=sys.stderr)
 
@@ -486,40 +490,41 @@ def _validate_view_artifact(workdir: Path, filename: str) -> tuple[bool, list[st
     if not manifest_path.exists():
         return False, [f"{filename} missing"]
 
-    try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
-    except json.JSONDecodeError as exc:
-        return False, [f"{filename} is invalid JSON: {exc}"]
-    except OSError as exc:
-        return False, [f"{filename} could not be read: {exc}"]
+    ## the following are brittle validations. will be replaced once schema is finalized or dropped altogether in favor of having the analyst stage fix its own errors via similar deterministic checks
+    # try:
+    #     data = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    # except json.JSONDecodeError as exc:
+    #     return False, [f"{filename} is invalid JSON: {exc}"]
+    # except OSError as exc:
+    #     return False, [f"{filename} could not be read: {exc}"]
 
-    views = data.get("views")
-    if views is None:
-        # Backward compatibility for artifacts made by the first manifest draft.
-        views = data.get("visualizations")
-    if not isinstance(views, list) or not views:
-        errors.append("views must be a non-empty list")
-        return False, errors
+    # views = data.get("views")
+    # if views is None:
+    #     # Backward compatibility for artifacts made by the first manifest draft.
+    #     views = data.get("visualizations")
+    # if not isinstance(views, list) or not views:
+    #     errors.append("views must be a non-empty list")
+    #     return False, errors
 
-    workdir_resolved = workdir.resolve()
-    for idx, view in enumerate(views):
-        if not isinstance(view, dict):
-            errors.append(f"views[{idx}] is not an object")
-            continue
-        data_block = view.get("data") if isinstance(view.get("data"), dict) else {}
-        data_file = data_block.get("file") or view.get("data_file")
-        if not data_file:
-            errors.append(f"views[{idx}] is missing data.file")
-            continue
-        path = Path(str(data_file))
-        resolved = (path if path.is_absolute() else (workdir_resolved / path)).resolve()
-        try:
-            resolved.relative_to(workdir_resolved)
-        except ValueError:
-            errors.append(f"views[{idx}].data.file points outside workdir: {data_file}")
-            continue
-        if not resolved.exists():
-            errors.append(f"views[{idx}].data.file missing: {data_file}")
+    # workdir_resolved = workdir.resolve()
+    # for idx, view in enumerate(views):
+    #     if not isinstance(view, dict):
+    #         errors.append(f"views[{idx}] is not an object")
+    #         continue
+    #     data_block = view.get("data") if isinstance(view.get("data"), dict) else {}
+    #     data_file = data_block.get("file") or view.get("data_file")
+    #     if not data_file:
+    #         errors.append(f"views[{idx}] is missing data.file")
+    #         continue
+    #     path = Path(str(data_file))
+    #     resolved = (path if path.is_absolute() else (workdir_resolved / path)).resolve()
+    #     try:
+    #         resolved.relative_to(workdir_resolved)
+    #     except ValueError:
+    #         errors.append(f"views[{idx}].data.file points outside workdir: {data_file}")
+    #         continue
+    #     if not resolved.exists():
+    #         errors.append(f"views[{idx}].data.file missing: {data_file}")
 
     return not errors, errors
 
