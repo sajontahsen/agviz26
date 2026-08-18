@@ -117,9 +117,8 @@ def _task_title(workdir: Path) -> str:
 
 
 def _findings_html(workdir: Path) -> str:
-    try:
-        data = json.loads((workdir / "analysis_manifest.json").read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+    data = _read_first_json(workdir, ["analysis_manifest.json", "analysis_skeleton.json"])
+    if not isinstance(data, dict):
         return "<p>Reliable findings were not available.</p>"
 
     parts: list[str] = []
@@ -127,19 +126,23 @@ def _findings_html(workdir: Path) -> str:
     if summary:
         parts.append(f'<p class="summary">{escape(summary)}</p>')
 
-    visualizations = data.get("visualizations")
-    if not isinstance(visualizations, list) or not visualizations:
+    views = data.get("views")
+    if views is None:
+        views = data.get("visualizations")
+    if not isinstance(views, list) or not views:
         parts.append("<p>Reliable findings were not available.</p>")
         return "\n".join(parts)
 
     rows = []
-    for viz in visualizations[:40]:
-        if not isinstance(viz, dict):
+    for view in views[:40]:
+        if not isinstance(view, dict):
             continue
-        title = escape(str(viz.get("title") or viz.get("id") or "Finding"))
-        answer = escape(str(viz.get("answer") or ""))[:600]
-        data_file = escape(str(viz.get("data_file") or ""))
-        caveats = viz.get("caveats") or []
+        title = escape(str(view.get("title") or view.get("id") or "Finding"))
+        answer = escape(str(view.get("answer") or ""))[:600]
+        data_block = view.get("data") if isinstance(view.get("data"), dict) else {}
+        data_file = escape(str(data_block.get("file") or view.get("data_file") or ""))
+        analysis = view.get("analysis") if isinstance(view.get("analysis"), dict) else {}
+        caveats = analysis.get("caveats") or view.get("caveats") or []
         caveat_text = ""
         if isinstance(caveats, list) and caveats:
             caveat_text = f'<br><span class="muted">Caveats: {escape("; ".join(map(str, caveats[:3])))}</span>'
@@ -147,3 +150,12 @@ def _findings_html(workdir: Path) -> str:
         rows.append(f'<li><span class="k">{title}</span>: {answer}{data_text}{caveat_text}</li>')
     parts.append("<ul>" + "".join(rows) + "</ul>" if rows else "<p>Reliable findings were not available.</p>")
     return "\n".join(parts)
+
+
+def _read_first_json(workdir: Path, names: list[str]) -> Any:
+    for name in names:
+        try:
+            return json.loads((workdir / name).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None

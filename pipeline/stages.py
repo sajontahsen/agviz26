@@ -1,4 +1,4 @@
-"""Generation pipeline: analysis_builder -> coder, passing a compact manifest forward."""
+"""Generation pipeline: analysis_builder -> storyboard -> coder, passing compact artifacts forward."""
 from __future__ import annotations
 
 import json
@@ -29,6 +29,7 @@ LOCAL_MODEL = os.environ.get("VIS_ARENA_LOCAL_MODEL", "gpt-5-nano")
 
 _CLOUD_ROLES = {
     "analysis_builder": CLOUD_OPUS,
+    "storyboard": CLOUD_OPUS,
     "coder": CLOUD_OPUS,
 }
 
@@ -50,83 +51,160 @@ Your job is
 - to understand the task, inspect the raw data only as much as needed,
 - choose feasible analytical views, 
 - compute the answers with Python, 
-- and emit a compact build contract for the visualization coder.
+- and emit a compact analysis skeleton for the storyboard stage.
 
-Inputs:
-- WORKDIR/task.md — read fully. It is the task and may include additional metadata.
-- WORKDIR/data/ — inspect file names, schemas, headers, and small samples only.
-
-Required output:
-- source/analyze.py
-- outputs/* plot-ready data files
-- analysis_manifest.json at the workdir root
-
-analysis_manifest.json MUST be written programmatically by source/analyze.py.
-Do not hand-write final analytical numbers after eyeballing output. The script
-is the source of truth for findings, file paths, schemas, samples, and caveats.
-
-Manifest shape:
-{
-  "task_summary": "concise summary of the task and intended visualization",
-  "data_scope": {
-    "files_used": ["data/..."],
-    "filters": ["..."],
-    "time_range": "...",
-    "units": "...",
-    "known_limitations": ["..."]
-  },
-  "visualizations": [
-    {
-      "id": "short_snake_case",
-      "title": "insightful chart title",
-      "question": "atomic analytical question",
-      "answer": "computed answer in plain language",
-      "chart_type": "line_chart|bar_chart|stacked_bar|scatter|heatmap|network_summary|table|...",
-      "data_file": "outputs/example.csv",
-      "data_format": "csv|json",
-      "schema": {"field": "type"},
-      "sample": [{"field": "value"}],
-      "encoding": {"x": "...", "y": "...", "color": null, "tooltip": ["..."]},
-      "interaction": {"type": "hover_only|filter|select|tabs|static", "details": "..."},
-      "display_notes": "units, aggregations, filters, scope",
-      "caveats": ["..."]
-    }
-  ],
-  "narrative": {
-    "hook": "...",
-    "sections": [
-      {"title": "...", "visualization_ids": ["..."], "message": "..."}
-    ],
-    "payoff": "..."
-  }
-}
 
 Workflow:
-1. Read task.md and list data/.
+1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats. .
 2. Inspect small data samples/headers/schemas. Do not dump full datasets.
-3. Pick 3-6 useful, feasible visualization views that directly answer the task.
+3. Pick useful, feasible analytical views that directly answer the task.
+- Prioritize questions that answer the core tasks. Drop secondary sub-tasks to keep scope manageable. If open-ended, extrapolate strictly 5-6 questions.
 4. Write source/analyze.py. It must:
    - load raw data once where practical;
    - create outputs/ if needed;
    - compute each view inside its own try/except block;
    - print concise traceback summaries for failed views;
-   - write one plot-ready output file per successful visualization;
-   - build analysis_manifest.json from successful visualizations only;
-   - include generated schema, sample rows/items, caveats, filters, units, and file paths.
+   - write one plot-ready output file per successful view;
+   - build analysis_skeleton.json from successful views only;
+   - include generated schema, sample rows/items, caveats, assumptions, and file paths.
 5. Run source/analyze.py with bash.
 6. If a view fails twice, simplify or drop that view. Preserve the working views.
-7. Finish only after analysis_manifest.json exists and references real output files.
+7. Finish only after analysis_skeleton.json exists and references real output files.
+
+Skeleton shape:
+{
+  "task_summary": "concise summary of what was asked",
+  "data_context": {
+    "files_used": ["data/..."],
+    "record_shapes": {"optional concise schema/profile notes": "..."},
+    "assumptions": ["only include filters, units, date ranges, or joins that actually apply"],
+    "limitations": ["..."]
+  },
+  "views": [
+    {
+      "id": "short_snake_case",
+      "question": "atomic analytical question",
+      "answer_data": {
+        "file": "outputs/example.csv",
+        "format": "csv|json",
+        "schema": {"field": "type"} - For tabular data, map columns to types. For nested/graph data, describe the structure.,
+        "sample": [{"field": "value"} - A minimal snippet (e.g., 2 rows, or 1 node/edge) showing the EXACT structure.],
+        "grain": "one row/item means ..."
+      },
+      "method": "one concise sentence describing the computation",
+      "rationale": ["why it matters for the task and the story"],
+      "caveats": ["..."]
+    }
+  ]
+}
 
 Use pandas/networkx/json/csv as appropriate. Keep stdout concise. Prefer robust,
 simple calculations over elaborate fragile ones.
+
+Required output:
+- source/analyze.py
+- outputs/* plot-ready data files
+- analysis_skeleton.json at the workdir root
 
 Output limit: Each response is capped at ~8192 tokens. If source/analyze.py is
 too large for a single write_file call, write the first chunk with append=false,
 then continue with append=true for following chunks. For small edits, use
 str_replace instead of rewriting.
 
+analysis_skeleton.json MUST be written programmatically by source/analyze.py.
+Do not hand-write final analytical numbers after eyeballing output. The script
+is the source of truth for findings, file paths, schemas, samples, and caveats.
+
 Token Economy: Work economically — generation and evaluation share a fixed
 competition token budget."""
+
+STORYBOARD_SYSTEM = """You are the storyboard stage for a web data visualization agent.
+
+Your job is to turn computed analysis into an authoritative, compact
+visualization manifest for the coder. You do NOT read raw data, recompute
+metrics, or invent new analytical results.
+
+Inputs:
+- task.md — what was asked.
+- analysis_skeleton.json — computed views, answers, output files, schemas,
+  samples, methods, and caveats.
+
+Required output:
+- analysis_manifest.json at the workdir root.
+
+The final manifest is the coder's source of truth. It should enforce
+insightfulness, narrative coherence, visual craft, while
+preserving data fidelity from the analysis skeleton.
+
+Manifest shape:
+{
+  "task_summary": "...",
+  "data_context": {
+    "files_used": ["data/..."],
+    "assumptions": ["only facts that apply"],
+    "limitations": ["..."]
+  },
+  "views": [
+    {
+      "id": "same id from analysis_skeleton",
+      "title": "reader-facing chart/panel title",
+      "question": "...",
+      "answer": "...",
+      "data": {
+        "file": "outputs/example.csv",
+        "format": "csv|json",
+        "schema": {"field": "type"},
+        "sample": [{"field": "value"}],
+        "grain": "one row/item means ..."
+      },
+      "analysis": {
+        "method": "...",
+        "supports": ["..."],
+        "caveats": ["..."]
+      },
+      "presentation": {
+        "role": "setup|evidence|comparison|exception|payoff|reference",
+        "insight": "specific trend, contrast, exception, or implication this panel should make clear",
+        "recommended_view": "line chart|bar chart|stacked bar|scatterplot|network summary|table|...",
+        "plot_guidance": "high-level directions using exact field names where useful; avoid brittle low-level encoding specs unless necessary",
+        "interaction": "static|hover|filter|select|tabs|search|linked_highlight, with a short reason",
+        "annotations": ["specific labels/callouts the chart should include"],
+        "disclosures": ["filters, aggregations, scope, exclusions, or units that apply to this view"]
+      }
+    }
+  ],
+  "story": {
+    "hook": "...",
+    "sections": [
+      {
+        "title": "...",
+        "purpose": "why this section exists in the story",
+        "view_ids": ["..."],
+        "message": "the narrative beat this section should communicate"
+      }
+    ],
+    "payoff": "concise concluding takeaway"
+  },
+  "evaluation_targets": {
+    "insightfulness": ["trends/exceptions/comparisons the artifact should foreground"],
+    "narrative_coherence": ["how the sections build from hook to payoff"],
+    "visual_craft": ["labeling, chart-type, disclosure, and readability requirements"],
+    "functionality": ["interactions that must be implemented and tested"]
+  }
+}
+
+Workflow:
+1. Read task.md and analysis_skeleton.json.
+2. Preserve every computed view unless it is redundant or too weak to support the task.
+3. Add reader-facing titles, section flow, insights, plot guidance, interactions,
+   annotations, and disclosures. Use exact data field names from the skeleton
+   when telling the coder what fields matter, but do not over-specify low-level
+   encodings such as x/y/color unless they are central to correctness.
+4. Keep the manifest compact. Do not inline full datasets or long samples.
+5. Write valid JSON to analysis_manifest.json and call finish.
+
+Token Economy: The analyst and storyboard share a 300k generation sub-budget.
+Spend most of your effort on coherent story structure and evaluable insight."""
 
 CODER_SYSTEM = """You are the visualization-coder stage for a web data visualization agent. 
 
@@ -135,21 +213,22 @@ analysis_manifest.json plus the output files it references. Build one cohesive, 
 
 Read:
 - analysis_manifest.json at the workdir root.
-- task.md — what was asked.
 
-Avoid reading raw data/ unless absolutely necessary to recover from a
+Avoid reading task.md or raw data/ unless absolutely necessary to recover from a
 manifest defect. Do not re-analyze, recompute, or second-guess findings. Build
-the dashboard from the manifest's narrative, visualization specs, answers,
-caveats, and referenced outputs.
+the dashboard from the manifest's story, view presentation guidance, answers,
+caveats, disclosures, and referenced outputs.
 
 Build:
 - Write source/build.py that reads analysis_manifest.json and every referenced
   outputs/* file, embeds what it needs inline as JSON (use json.dumps() to safely
   inject into <script> tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
-- Use the manifest's narrative.hook, narrative.sections, visualization titles,
-  answers, display_notes, caveats, and narrative.payoff to create a clear story.
-- Follow each visualization's chart_type and encoding. Map exact data fields
-  from schema/sample/output files; do not invent renamed keys.
+- Use the manifest's story.hook, story.sections, view titles, answers,
+  presentation.insight, presentation.disclosures, caveats, and story.payoff to
+  create a clear story.
+- Follow each view's presentation.recommended_view, plot_guidance, interaction,
+  annotations, and disclosures. Map exact data fields from schema/sample/output
+  files; do not invent renamed keys.
 - For interactive elements or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
 - Apply a cohesive, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
 - Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
@@ -237,7 +316,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         user_prompt=(
             f"WORKDIR={wd}\n"
             "Read task.md, inspect data/ as needed, write and run source/analyze.py, "
-            "then emit analysis_manifest.json and outputs/*."
+            "then emit analysis_skeleton.json and outputs/*."
         ),
         tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
         model=pick_model("analysis_builder"),
@@ -246,8 +325,39 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         budget=analysis_budget,
         low_water=100_000,
     )
-    budget.spent += analysis.usage.get("total_tokens", 0)
     results.append(analysis)
+
+    skeleton_ok, skeleton_errors = _validate_analysis_skeleton(workdir)
+    if skeleton_errors:
+        for err in skeleton_errors:
+            print(f"[pipeline] analysis_skeleton validation: {err}", file=sys.stderr)
+
+    if skeleton_ok and not analysis_budget.exhausted():
+        storyboard = _safe_run(
+            ctx=ctx,
+            client=client,
+            name="storyboard",
+            system_prompt=STORYBOARD_SYSTEM,
+            user_prompt=(
+                f"WORKDIR={wd}\n"
+                "Read task.md and analysis_skeleton.json, then write analysis_manifest.json. "
+                "Preserve computed answers and output file references; add story, insight, "
+                "presentation guidance, and evaluation targets."
+            ),
+            tool_names=["read_file", "write_file", "str_replace"],
+            model=pick_model("storyboard"),
+            max_steps=24,
+            prune_keep=10,
+            budget=analysis_budget,
+            low_water=50_000,
+        )
+        results.append(storyboard)
+    elif skeleton_ok:
+        print("[pipeline] skipping storyboard because shared analysis budget is exhausted", file=sys.stderr)
+    else:
+        print("[pipeline] skipping storyboard because analysis_skeleton.json is not build-ready", file=sys.stderr)
+
+    budget.spent += analysis_budget.spent
 
     manifest_ok, manifest_errors = _validate_analysis_manifest(workdir)
     if manifest_errors:
@@ -285,7 +395,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
 
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
-    fallback_info = ensure_fallback_dist(workdir, findings_available=manifest_ok)
+    fallback_info = ensure_fallback_dist(workdir, findings_available=manifest_ok or skeleton_ok)
 
     # Move intermediate JSON files to source/state/ for clean root directory.
     _cleanup_state_files(workdir)
@@ -293,6 +403,8 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
     return _summarize(
         workdir,
         results,
+        skeleton_ok=skeleton_ok,
+        skeleton_errors=skeleton_errors,
         manifest_ok=manifest_ok,
         manifest_errors=manifest_errors,
         fallback_info=fallback_info,
@@ -312,6 +424,8 @@ def _summarize(
     workdir: Path,
     results: list[StageResult],
     *,
+    skeleton_ok: bool,
+    skeleton_errors: list[str],
     manifest_ok: bool,
     manifest_errors: list[str],
     fallback_info: dict[str, Any],
@@ -335,7 +449,10 @@ def _summarize(
         "pipeline": {
             "total_tokens": total,
             "ceiling": GEN_TOKEN_CEILING,
+            "analysis_ceiling": ANALYSIS_TOKEN_CEILING,
             "dist_ready": dist_ready,
+            "analysis_skeleton_valid": skeleton_ok,
+            "analysis_skeleton_errors": skeleton_errors,
             "analysis_manifest_valid": manifest_ok,
             "analysis_manifest_errors": manifest_errors,
             "fallback": fallback_info,
@@ -352,42 +469,57 @@ def _summarize(
 # Manifest validation
 # ---------------------------------------------------------------------------
 
+def _validate_analysis_skeleton(workdir: Path) -> tuple[bool, list[str]]:
+    """Minimal storyboard-readiness check for analysis_skeleton.json."""
+    return _validate_view_artifact(workdir, "analysis_skeleton.json")
+
+
 def _validate_analysis_manifest(workdir: Path) -> tuple[bool, list[str]]:
     """Minimal build-readiness check for analysis_manifest.json."""
-    manifest_path = workdir / "analysis_manifest.json"
+    return _validate_view_artifact(workdir, "analysis_manifest.json")
+
+
+def _validate_view_artifact(workdir: Path, filename: str) -> tuple[bool, list[str]]:
+    """Minimal check that a JSON artifact has views pointing at real output files."""
+    manifest_path = workdir / filename
     errors: list[str] = []
     if not manifest_path.exists():
-        return False, ["analysis_manifest.json missing"]
+        return False, [f"{filename} missing"]
 
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
     except json.JSONDecodeError as exc:
-        return False, [f"analysis_manifest.json is invalid JSON: {exc}"]
+        return False, [f"{filename} is invalid JSON: {exc}"]
     except OSError as exc:
-        return False, [f"analysis_manifest.json could not be read: {exc}"]
+        return False, [f"{filename} could not be read: {exc}"]
 
-    visualizations = data.get("visualizations")
-    if not isinstance(visualizations, list) or not visualizations:
-        errors.append("visualizations must be a non-empty list")
+    views = data.get("views")
+    if views is None:
+        # Backward compatibility for artifacts made by the first manifest draft.
+        views = data.get("visualizations")
+    if not isinstance(views, list) or not views:
+        errors.append("views must be a non-empty list")
         return False, errors
 
     workdir_resolved = workdir.resolve()
-    for idx, viz in enumerate(visualizations):
-        if not isinstance(viz, dict):
-            errors.append(f"visualizations[{idx}] is not an object")
+    for idx, view in enumerate(views):
+        if not isinstance(view, dict):
+            errors.append(f"views[{idx}] is not an object")
             continue
-        data_file = viz.get("data_file")
+        data_block = view.get("data") if isinstance(view.get("data"), dict) else {}
+        data_file = data_block.get("file") or view.get("data_file")
         if not data_file:
+            errors.append(f"views[{idx}] is missing data.file")
             continue
         path = Path(str(data_file))
         resolved = (path if path.is_absolute() else (workdir_resolved / path)).resolve()
         try:
             resolved.relative_to(workdir_resolved)
         except ValueError:
-            errors.append(f"visualizations[{idx}].data_file points outside workdir: {data_file}")
+            errors.append(f"views[{idx}].data.file points outside workdir: {data_file}")
             continue
         if not resolved.exists():
-            errors.append(f"visualizations[{idx}].data_file missing: {data_file}")
+            errors.append(f"views[{idx}].data.file missing: {data_file}")
 
     return not errors, errors
 
@@ -400,6 +532,7 @@ def _cleanup_state_files(workdir: Path) -> None:
 
     files_to_move = [
         "analysis_manifest.json",
+        "analysis_skeleton.json",
         # Clean up legacy leftovers if present from interrupted/local runs.
         "profile.json",
         "questions.json",
