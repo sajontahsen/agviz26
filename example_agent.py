@@ -139,7 +139,7 @@ def models() -> dict[str, Any]:
 
 
 def generate(workdir: Path) -> dict[str, Any]:
-    # Staged pipeline: analysis_builder -> storyboard -> coder (see pipeline/stages.py).
+    # Staged pipeline: analysis_builder -> narrative_coder (see pipeline/stages.py).
     from pipeline.stages import orchestrate
 
     return orchestrate(workdir)

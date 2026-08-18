@@ -117,7 +117,7 @@ def _task_title(workdir: Path) -> str:
 
 
 def _findings_html(workdir: Path) -> str:
-    data = _read_first_json(workdir, ["analysis_manifest.json", "analysis_skeleton.json"])
+    data = _read_first_json(workdir, ["analysis_skeleton.json", "analysis_manifest.json"])
     if not isinstance(data, dict):
         return "<p>Reliable findings were not available.</p>"
 
@@ -138,9 +138,11 @@ def _findings_html(workdir: Path) -> str:
         if not isinstance(view, dict):
             continue
         title = escape(str(view.get("title") or view.get("id") or "Finding"))
-        answer = escape(str(view.get("answer") or ""))[:600]
+        fallback_answer = view.get("answer") or view.get("question") or view.get("method") or ""
+        answer = escape(str(fallback_answer))[:600]
         data_block = view.get("data") if isinstance(view.get("data"), dict) else {}
-        data_file = escape(str(data_block.get("file") or view.get("data_file") or ""))
+        answer_data = view.get("answer_data") if isinstance(view.get("answer_data"), dict) else {}
+        data_file = escape(str(data_block.get("file") or answer_data.get("file") or view.get("data_file") or ""))
         analysis = view.get("analysis") if isinstance(view.get("analysis"), dict) else {}
         caveats = analysis.get("caveats") or view.get("caveats") or []
         caveat_text = ""

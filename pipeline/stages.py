@@ -1,4 +1,4 @@
-"""Generation pipeline: analysis_builder -> storyboard -> coder, passing compact artifacts forward."""
+"""Generation pipeline: analysis_builder -> narrative_coder, passing one compact artifact forward."""
 from __future__ import annotations
 
 import json
@@ -29,15 +29,14 @@ LOCAL_MODEL = os.environ.get("VIS_ARENA_LOCAL_MODEL", "gpt-5-nano")
 
 _CLOUD_ROLES = {
     "analysis_builder": CLOUD_OPUS,
-    "storyboard": CLOUD_OPUS,
-    "coder": CLOUD_OPUS,
+    "narrative_coder": CLOUD_OPUS,
 }
 
 
 def pick_model(role: str) -> str:
     """Cloud jobs get role-appropriate Claude models; local runs use LOCAL_MODEL."""
     if os.environ.get("VIS_ARENA_JOB_ID"):
-        return _CLOUD_ROLES.get(role, CLOUD_SONNET)
+        return _CLOUD_ROLES.get(role, CLOUD_OPUS)
     return LOCAL_MODEL
 
 
@@ -51,7 +50,7 @@ Your job is
 - to understand the task, inspect the raw data only as much as needed,
 - choose feasible analytical views, 
 - compute the answers with Python, 
-- and emit a compact analysis skeleton for the storyboard stage.
+- and emit a compact analysis skeleton for the coder stage.
 
 Workflow:
 1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats.
@@ -116,140 +115,81 @@ str_replace instead of rewriting.
 Token Economy: Work economically — generation and evaluation share a fixed
 competition token budget."""
 
-STORYBOARD_SYSTEM = """You are the storyboard stage for a web data visualization agent.
+NARRATIVE_CODER_SYSTEM = """You are the narrative-coder stage for a web data visualization agent.
 
-Your job is to turn computed analysis into an authoritative, coherent
-visualization blueprint for the coder. You do NOT read raw data, recompute
-metrics, or invent new analytical results. The output is the coder's source of truth. It should enforce insightfulness, narrative coherence, visual craft, while preserving data fidelity from the analysis skeleton.
+Your job is to turn computed analysis into one cohesive, self-contained,
+interactive data story at dist/index.html. You own insightfulness,
+narrative coherence, visual craft, and functionality. 
 
+Inputs::
+- analysis_skeleton.json — the authoritative inventory of computed views,
+  output files, schemas, samples, methods, rationales, caveats, assumptions,
+  and limitations.
 
-Inputs:
-- task.md — what was asked.
-- analysis_skeleton.json — analysis questions, computed answers, output files, schemas,
-  samples, methods, and caveats.
-
-Required output:
-- analysis_manifest.json at the workdir root.
+Do NOT read task.md or raw data/ unless absolutely necessary to recover from a skeleton
+defect. Do NOT re-analyze or second-guess the analyst. Use only
+analysis_skeleton.json and the referenced outputs/* files as analytical truth.
 
 Workflow:
 1. Read the inputs to understand what was asked and what findings were computed.
-2. Figure out the most coherent way to arrange these findings into a unified dashboard. Strictly follow data visualization best practices. 
-3. Preserve every computed view unless it is redundant or too weak to support the task.
-4. Add reader-facing titles, section flow, insights, plot guidance, interactions,
-   annotations, and disclosures. Use exact data field names from the skeleton
-   when telling the coder what fields matter, but do not over-specify low-level
-   encodings such as x/y/color unless they are central to correctness.
-5. Keep the manifest compact. Do not inline full datasets or long samples.
-6. Write valid JSON to analysis_manifest.json and call finish.
-
-
-Manifest shape:
-{
-  "task_summary": "...",
-  "data_context": {
-    "files_used": ["data/..."],
-    "assumptions": ["only facts that apply"],
-    "limitations": ["..."]
-  },
-  "views": [
-    {
-      "id": "same id from analysis_skeleton",
-      "title": "reader-facing chart/panel title",
-      "question": "...",
-      "answer": "...",
-      "data": {
-        "file": "outputs/example.csv",
-        "format": "csv|json",
-        "schema": {"field": "type"},
-        "sample": [{"field": "value"}],
-        "grain": "one row/item means ..."
-      },
-      "analysis": {
-        "method": "...",
-        "supports": ["..."],
-        "caveats": ["..."]
-      },
-      "presentation": {
-        "role": "setup|evidence|comparison|exception|payoff|reference",
-        "insight": "specific trend, contrast, exception, or implication this panel should make clear",
-        "recommended_view": "line chart|bar chart|stacked bar|scatterplot|network summary|table|...",
-        "plot_guidance": "high-level directions using exact field names where useful; avoid brittle low-level encoding specs unless necessary",
-        "interaction": "static|hover|filter|select|tabs|search|linked_highlight, with a short reason",
-        "annotations": ["specific labels/callouts the chart should include"],
-        "disclosures": ["filters, aggregations, scope, exclusions, or units that apply to this view"]
-      }
-    }
-  ],
-  "story": {
-    "hook": "...",
-    "sections": [
-      {
-        "title": "...",
-        "purpose": "why this section exists in the story",
-        "view_ids": ["..."],
-        "message": "the narrative beat this section should communicate"
-      }
-    ],
-    "payoff": "concise concluding takeaway"
-  },
-  "evaluation_targets": {
-    "insightfulness": ["trends/exceptions/comparisons the artifact should foreground"],
-    "narrative_coherence": ["how the sections build from hook to payoff"],
-    "visual_craft": ["labeling, chart-type, disclosure, and readability requirements"],
-    "functionality": ["interactions that must be implemented and tested"]
-  }
-}
-
-Output limit: Each response is capped at ~8192 tokens. If a file is
-too large for a single write_file call, write the first chunk with append=false,
-then continue with append=true for following chunks. For small edits, use
-str_replace instead of rewriting.
-
-Token Economy: The analyst and storyboard share a 300k generation sub-budget.
-Spend most of your effort on coherent story structure and evaluable insight."""
-
-CODER_SYSTEM = """You are the visualization-coder stage for a web data visualization agent. 
-
-Your job is presentation engineering. The analytical source of truth is
-analysis_manifest.json plus the output files it references. Build one cohesive, self-contained, interactive artifact at dist/index.html.
-
-Read:
-- analysis_manifest.json at the workdir root.
-
-Avoid reading task.md or raw data/ unless absolutely necessary to recover from a
-manifest defect. Do not re-analyze, recompute, or second-guess findings. Build
-the dashboard from the manifest's story, view presentation guidance, answers,
-caveats, disclosures, and referenced outputs.
-
-Build:
-- Write source/build.py that reads analysis_manifest.json and every referenced
+2. Plan the story arc before coding. Choose a hook, coherent sections and 
+   a payoff that directly answer the task. Group related views; 
+   drop only views that are redundant or too weak.
+3. Decide chart forms and interactions while planning the page, not in a
+   separate manifest. Prefer familiar, inspectable charts over clever forms.
+4. Write source/build.py that reads analysis_skeleton.json and every referenced
   outputs/* file, embeds what it needs inline as JSON (use json.dumps() to safely
-  inject into <script> tags), and writes dist/index.html. Run it with bash. You do NOT need to read the data files into your own context — build.py reads them.
-- Use the manifest's story.hook, story.sections, view titles, answers,
-  presentation.insight, presentation.disclosures, caveats, and story.payoff to
-  create a clear story.
-- Follow each view's presentation.recommended_view, plot_guidance, interaction,
-  annotations, and disclosures. Map exact data fields from schema/sample/output
-  files; do not invent renamed keys. Write defensive JavaScript to handle potential nulls or missing keys smoothly.
-- For interactive elements or other exploratory questions, you MUST implement working UI controls (dropdowns, tabs, sliders, etc.) using vanilla HTML/JS/CSS to filter or transform the plotted data dynamically. Do NOT rely purely on Plotly defaults.
-- Apply a cohesive, minimalist design system using vanilla CSS. Use modern typography, a cohesive color palette, subtle borders for UI controls, and flexbox/grid for crisp layouts. Do not leave the page with unstyled browser defaults.
-- Static charts (like deep statistical cuts) are perfectly fine as long as they implement good practices (e.g., tooltips, clear labels). Strive for a coherent balance between static insights and interactive exploration.
+   inject into <script> tags), and writes dist/index.html. Run it with bash.
+   You do NOT need to read the data files into your own context; build.py
+   reads them.
+5. Verify, fix, rerun, and verify again until the artifact renders cleanly.
+
+Narrative and insight requirements:
+- The page must feel like an analytical answer, not a chart dump.
+- Start with a specific hook that frames the central question and why the
+  findings matter.
+- Each section needs a clear claim, supporting visualization, and short
+  interpretation. Call out trends, exceptions, comparisons, turning points,
+  and implications.
+- Make the payoff decision-pointing: what should the intended reader conclude,
+  inspect next, or believe based on the evidence?
+- Preserve caveats and data limitations near the relevant charts, especially
+  synthetic/future years, incomplete influence edges, filters, units, and
+  aggregation choices. Mention only caveats that apply.
+- If analysis_skeleton lacks prose answers, derive concise claims from the
+  plot-ready outputs inside build.py, not from raw data.
+
+Visual craft and functionality requirements:
+- Choose chart types based on the output data grain and task: line/area for
+  time trends, ranked bars for top categories, scatter/small multiples for
+  comparisons, compact tables for sparse evidence, and summarized networks for
+  graph relations.
+- Use exact field names from answer_data.schema/sample/output files. Do not
+  invent renamed keys. Be defensive about nulls and about samples represented
+  as arrays rather than objects.
+- Implement a number of meaningful controls yourself with vanilla JS
+  when they help the story: tabs, filters, search, toggles, or linked
+  highlighting. Do not rely purely on Plotly defaults for interactivity.
+- Use Plotly hover/tooltips, readable axes, legends, labels, units, annotations,
+  and chart captions. Never render tens of thousands of nodes raw.
+- Apply a cohesive, minimalist design system using vanilla CSS. Avoid unstyled
+  browser defaults. Keep layout readable at desktop and mobile widths.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
-- Never render tens of thousands of nodes raw.
 - The page must render from dist/index.html with no dev server.
+
 - Token Economy: Work economically — the job has a shared token budget.
-- Output limit: Each response is capped at ~8192 tokens. If a file is too large
-  for a single write_file call, write the first chunk with append=false, then
+- Output limit: Each response is capped at ~8192 tokens. When writing large files 
+  with write_file, write the first chunk with append=false, then
   continue with append=true for each following chunk. For small edits to an
   existing file, use str_replace instead of rewriting.
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
 - visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
-- data_fidelity: numbers on screen match the actual data.
 - insightfulness: call out trends, exceptions, comparisons — not just raw charts.
 - narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
+- data_fidelity: numbers on screen match the actual data.
 
 Validation Loop:
 When the page is written, you MUST call the verify tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
@@ -334,49 +274,18 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         for err in skeleton_errors:
             print(f"[pipeline] analysis_skeleton validation: {err}", file=sys.stderr)
 
-    if skeleton_ok and not analysis_budget.exhausted():
-        storyboard = _safe_run(
-            ctx=ctx,
-            client=client,
-            name="storyboard",
-            system_prompt=STORYBOARD_SYSTEM,
-            user_prompt=(
-                f"WORKDIR={wd}\n"
-                "Read task.md and analysis_skeleton.json, then write analysis_manifest.json. "
-                "Preserve computed answers and output file references; add story, insight, "
-                "presentation guidance, and evaluation targets."
-            ),
-            tool_names=["read_file", "write_file", "str_replace"],
-            model=pick_model("storyboard"),
-            max_steps=24,
-            prune_keep=16,
-            budget=analysis_budget,
-            low_water=50_000,
-        )
-        results.append(storyboard)
-    elif skeleton_ok:
-        print("[pipeline] skipping storyboard because shared analysis budget is exhausted",
-         file=sys.stderr)
-        # todo: log this properly via results
-    else:
-        print("[pipeline] skipping storyboard because analysis_skeleton.json is not build-ready", file=sys.stderr)
-
     budget.spent += analysis_budget.spent
 
-    manifest_ok, manifest_errors = _validate_analysis_manifest(workdir)
-    if manifest_errors:
-        for err in manifest_errors:
-            print(f"[pipeline] analysis_manifest validation: {err}", file=sys.stderr)
-
-    if manifest_ok:
-        coder_system = CODER_SYSTEM
+    if skeleton_ok:
+        coder_system = NARRATIVE_CODER_SYSTEM
         coder_user = (
             f"WORKDIR={wd}\n"
-            "Read analysis_manifest.json, then write and run source/build.py to produce "
+            "Read analysis_skeleton.json. Design the narrative, " 
+            "then write and run source/build.py to produce "
             "dist/index.html. Verify it renders before finishing."
         )
     else:
-        print("[pipeline] running fallback coder because analysis_manifest.json is not build-ready", file=sys.stderr)
+        print("[pipeline] running fallback coder because analysis_skeleton.json is not build-ready", file=sys.stderr)
         coder_system = CODER_FALLBACK_SYSTEM
         coder_user = (
             f"WORKDIR={wd}\n"
@@ -391,15 +300,15 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         system_prompt=coder_system,
         user_prompt=coder_user,
         tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
-        model=pick_model("coder"),
+        model=pick_model("narrative_coder"),
         max_steps=70,
-        prune_keep=12,
+        prune_keep=16,
         budget=budget,
     ))
 
     # Guarantee a renderable artifact so the job always yields a scorable
     # preview to inspect, rather than a hard "dist/index.html was not created".
-    fallback_info = ensure_fallback_dist(workdir, findings_available=manifest_ok or skeleton_ok)
+    fallback_info = ensure_fallback_dist(workdir, findings_available=skeleton_ok)
 
     # Move intermediate JSON files to source/state/ for clean root directory.
     _cleanup_state_files(workdir)
@@ -409,8 +318,6 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         results,
         skeleton_ok=skeleton_ok,
         skeleton_errors=skeleton_errors,
-        manifest_ok=manifest_ok,
-        manifest_errors=manifest_errors,
         fallback_info=fallback_info,
     )
 
@@ -430,8 +337,6 @@ def _summarize(
     *,
     skeleton_ok: bool,
     skeleton_errors: list[str],
-    manifest_ok: bool,
-    manifest_errors: list[str],
     fallback_info: dict[str, Any],
 ) -> dict[str, Any]:
     """Build a rich telemetry dict for generation.json (the framework reads the notes key)."""
@@ -457,8 +362,6 @@ def _summarize(
             "dist_ready": dist_ready,
             "analysis_skeleton_valid": skeleton_ok,
             "analysis_skeleton_errors": skeleton_errors,
-            "analysis_manifest_valid": manifest_ok,
-            "analysis_manifest_errors": manifest_errors,
             "fallback": fallback_info,
         },
         "stages": stages_meta,
@@ -470,17 +373,12 @@ def _summarize(
 
 
 # ---------------------------------------------------------------------------
-# Manifest validation
+# Analysis artifact validation
 # ---------------------------------------------------------------------------
 
 def _validate_analysis_skeleton(workdir: Path) -> tuple[bool, list[str]]:
-    """Minimal storyboard-readiness check for analysis_skeleton.json."""
+    """Minimal narrative-coder-readiness check for analysis_skeleton.json."""
     return _validate_view_artifact(workdir, "analysis_skeleton.json")
-
-
-def _validate_analysis_manifest(workdir: Path) -> tuple[bool, list[str]]:
-    """Minimal build-readiness check for analysis_manifest.json."""
-    return _validate_view_artifact(workdir, "analysis_manifest.json")
 
 
 def _validate_view_artifact(workdir: Path, filename: str) -> tuple[bool, list[str]]:
