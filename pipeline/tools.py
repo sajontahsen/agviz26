@@ -116,6 +116,21 @@ def str_replace(args: dict[str, Any], ctx: ToolContext) -> str:
     return f"Edited {path} (1 replacement)."
 
 
+def apply_patch(args: dict[str, Any], ctx: ToolContext) -> str:
+    patch_text = args.get("patch")
+    if not isinstance(patch_text, str) or not patch_text.strip():
+        return "Error: apply_patch requires a non-empty unified diff in 'patch'."
+    try:
+        changed = _apply_unified_diff(patch_text, ctx)
+    except ValueError as exc:
+        return f"Patch error: {exc}"
+    except OSError as exc:
+        return f"Patch file error: {exc}"
+    if not changed:
+        return "Patch error: no file changes found in patch."
+    return "Applied patch:\n" + "\n".join(f"- {path} ({count} hunks)" for path, count in changed)
+
+
 def search(args: dict[str, Any], ctx: ToolContext) -> str:
     pattern = args.get("pattern")
     if not pattern:
@@ -367,6 +382,129 @@ def _run_bash(command: str, cwd: Path, timeout_s: int = 300) -> str:
     return f"$ {command}\nexit={completed.returncode}\n{completed.stdout}"
 
 
+def _apply_unified_diff(patch_text: str, ctx: ToolContext) -> list[tuple[str, int]]:
+    lines = patch_text.splitlines(keepends=True)
+    i = 0
+    changed: list[tuple[str, int]] = []
+    while i < len(lines):
+        if not lines[i].startswith("--- "):
+            i += 1
+            continue
+        old_name = _parse_diff_path(lines[i][4:])
+        i += 1
+        if i >= len(lines) or not lines[i].startswith("+++ "):
+            raise ValueError(f"expected +++ header after --- {old_name}")
+        new_name = _parse_diff_path(lines[i][4:])
+        i += 1
+
+        target_name = new_name if new_name != "/dev/null" else old_name
+        if target_name == "/dev/null":
+            raise ValueError("delete-only patches are not supported")
+        target = _resolve_patch_target(target_name, ctx)
+        file_lines = [] if old_name == "/dev/null" else target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+        hunks = 0
+        line_offset = 0
+        while i < len(lines) and lines[i].startswith("@@"):
+            header = lines[i]
+            old_start = _parse_hunk_start(header)
+            i += 1
+            old_chunk: list[str] = []
+            new_chunk: list[str] = []
+            while i < len(lines) and not lines[i].startswith("@@") and not lines[i].startswith("--- "):
+                line = lines[i]
+                i += 1
+                if line.startswith("\\"):
+                    continue
+                if not line:
+                    raise ValueError("empty patch line without a diff prefix")
+                prefix, text = line[0], line[1:]
+                if prefix == " ":
+                    old_chunk.append(text)
+                    new_chunk.append(text)
+                elif prefix == "-":
+                    old_chunk.append(text)
+                elif prefix == "+":
+                    new_chunk.append(text)
+                else:
+                    raise ValueError(f"bad patch line prefix {prefix!r} in {target_name}")
+
+            expected = max(0, old_start - 1 + line_offset)
+            file_lines, delta = _apply_hunk(file_lines, old_chunk, new_chunk, expected, target_name)
+            line_offset += delta
+            hunks += 1
+
+        if hunks == 0:
+            raise ValueError(f"no hunks found for {target_name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("".join(file_lines), encoding="utf-8")
+        changed.append((str(target), hunks))
+    return changed
+
+
+def _parse_diff_path(raw: str) -> str:
+    path = raw.strip().split("\t", 1)[0].split(" ", 1)[0]
+    if path in {"/dev/null", "dev/null"}:
+        return "/dev/null"
+    if path.startswith(("a/", "b/")):
+        path = path[2:]
+    return path
+
+
+def _parse_hunk_start(header: str) -> int:
+    match = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", header)
+    if not match:
+        raise ValueError(f"bad hunk header: {header.strip()}")
+    return int(match.group(1))
+
+
+def _resolve_patch_target(path: str, ctx: ToolContext) -> Path:
+    target = ctx.resolve(path).resolve()
+    root = ctx.tool_root.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"patch target points outside workdir: {path}") from exc
+    return target
+
+
+def _apply_hunk(
+    file_lines: list[str],
+    old_chunk: list[str],
+    new_chunk: list[str],
+    expected: int,
+    target_name: str,
+) -> tuple[list[str], int]:
+    old_len = len(old_chunk)
+    if old_len == 0:
+        if expected > len(file_lines):
+            raise ValueError(f"hunk insertion point beyond end of {target_name}")
+        return file_lines[:expected] + new_chunk + file_lines[expected:], len(new_chunk)
+
+    if _matches_at(file_lines, old_chunk, expected):
+        start = expected
+    else:
+        matches = [
+            idx for idx in range(0, len(file_lines) - old_len + 1)
+            if _matches_at(file_lines, old_chunk, idx)
+        ]
+        if not matches:
+            raise ValueError(f"hunk context not found in {target_name}; read the file and regenerate the patch")
+        if len(matches) > 1:
+            raise ValueError(f"hunk context matched {len(matches)} places in {target_name}; add more context")
+        start = matches[0]
+
+    return (
+        file_lines[:start] + new_chunk + file_lines[start + old_len:],
+        len(new_chunk) - old_len,
+    )
+
+
+def _matches_at(file_lines: list[str], old_chunk: list[str], start: int) -> bool:
+    end = start + len(old_chunk)
+    return start >= 0 and end <= len(file_lines) and file_lines[start:end] == old_chunk
+
+
 def _which(name: str) -> str | None:
     for d in os.environ.get("PATH", "").split(os.pathsep):
         cand = Path(d) / name
@@ -425,6 +563,18 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ["path", "old_str", "new_str"],
     ),
+    "apply_patch": _fn(
+        "apply_patch",
+        "Apply a standard unified diff patch to files under the workdir. Use this for localized multi-line edits "
+        "when str_replace would require copying a large exact snippet. Patches must have ---/+++ file headers and @@ hunks.",
+        {
+            "patch": {
+                "type": "string",
+                "description": "Unified diff text. Paths may use a/ and b/ prefixes and must resolve under the workdir.",
+            },
+        },
+        ["patch"],
+    ),
     "search": _fn(
         "search",
         "Search files for a regex (ripgrep). Returns file:line:match.",
@@ -468,6 +618,7 @@ EXECUTORS: dict[str, Executor] = {
     "read_file": read_file,
     "write_file": write_file,
     "str_replace": str_replace,
+    "apply_patch": apply_patch,
     "search": search,
     "bash": bash,
     "verify": verify,

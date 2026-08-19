@@ -109,8 +109,8 @@ Required output:
 
 Output limit: Each response is capped at ~8192 tokens. If source/analyze.py is
 too large for a single write_file call, write the first chunk with append=false,
-then continue with append=true for following chunks. For small edits, use
-str_replace instead of rewriting.
+then continue with append=true for following chunks. For small exact edits, use
+str_replace; for localized multi-line edits, use apply_patch instead of rewriting.
 
 Token Economy: Work economically — generation and evaluation share a fixed
 competition token budget."""
@@ -158,8 +158,10 @@ Narrative and insight requirements:
   aggregation choices. Mention only caveats that apply.
 - If analysis_skeleton lacks prose answers, derive concise claims from the
   plot-ready outputs inside build.py, not from raw data.
+- Answers must be supported by visual evidence, not prose or text alone.  
 
 Visual craft and functionality requirements:
+- Follow data visualization standards and best practices.
 - Choose chart types based on the output data grain and task: line/area for
   time trends, ranked bars for top categories, scatter/small multiples for
   comparisons, compact tables for sparse evidence, and summarized networks for
@@ -172,8 +174,9 @@ Visual craft and functionality requirements:
   highlighting. Do not rely purely on Plotly defaults for interactivity.
 - Use Plotly hover/tooltips, readable axes, legends, labels, units, annotations,
   and chart captions. Never render tens of thousands of nodes raw.
-- Apply a cohesive, minimalist design system using vanilla CSS. Avoid unstyled
-  browser defaults. Keep layout readable at desktop and mobile widths.
+- Apply a cohesive, minimalist design system using vanilla CSS. 
+  Choose an accessible color palette. Avoid unstyled browser defaults. 
+  Keep layout readable at desktop and mobile widths.
 - Rendering libraries (pin these exact versions; load from CDN):
   Plotly.js https://cdn.plot.ly/plotly-2.35.2.min.js
 - The page must render from dist/index.html with no dev server.
@@ -182,7 +185,7 @@ Visual craft and functionality requirements:
 - Output limit: Each response is capped at ~8192 tokens. When writing large files 
   with write_file, write the first chunk with append=false, then
   continue with append=true for each following chunk. For small edits to an
-  existing file, use str_replace instead of rewriting.
+  existing file, use str_replace or apply_patch instead of rewriting.
 
 You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
@@ -228,7 +231,8 @@ Build:
 - Token Economy: Work economically — this is a recovery path.
 - Output limit: Each response is capped at ~8192 tokens. If a file is too large
   for a single write_file call, write the first chunk with append=false, then
-  continue with append=true for each following chunk.
+  continue with append=true for each following chunk. For localized edits, use
+  str_replace or apply_patch instead of rewriting.
 
 Validation Loop:
 When the page is written, you MUST call the verify tool. If verify reports
@@ -260,7 +264,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
             "Read task.md, inspect data/ as needed, write and run source/analyze.py, "
             "then emit analysis_skeleton.json and outputs/*."
         ),
-        tool_names=["read_file", "write_file", "str_replace", "bash", "search"],
+        tool_names=["read_file", "write_file", "str_replace", "apply_patch", "bash", "search"],
         model=pick_model("analysis_builder"),
         max_steps=60,
         prune_keep=16,
@@ -299,7 +303,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         name="coder",
         system_prompt=coder_system,
         user_prompt=coder_user,
-        tool_names=["read_file", "write_file", "str_replace", "bash", "search", "verify"],
+        tool_names=["read_file", "write_file", "str_replace", "apply_patch", "bash", "search", "verify"],
         model=pick_model("narrative_coder"),
         max_steps=70,
         prune_keep=16,
@@ -351,6 +355,7 @@ def _summarize(
             "steps": r.steps,
             "usage": r.usage,
             "tool_counts": r.tool_counts,
+            "model_errors": r.model_errors,
             "result": r.result,
         })
 

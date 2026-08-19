@@ -51,21 +51,24 @@ Workflow:
    returned telemetry for errors, chart counts, visible controls, and text.
 3. inspect() targeted selectors when you need exact labels, legends, values,
    tables, or tooltip text that are visible in the rendered page.
-4. If observe() reports controls, use act() on each distinct control type you
-   can reasonably test. act() returns a new screenshot; compare before/after
-   visually and with telemetry.
+4. If observe() reports meaningful analytic controls, use act() on each
+   distinct control type you can reasonably test. act() returns a new
+   screenshot; compare before/after visually and with telemetry.
 5. observe(full_page=true) or observe(selector=...) if important sections are
    below the fold or need closer inspection.
 6. finish only after your scores are grounded in visual observations.
 
-Rate each criterion 1-5 using these anchors. Use exact ids:
+Rate each criterion 1-5 using these anchors. Use exact ids. Award 5 for
+excellent work under the available rendered-page evidence; do not reserve 5
+for impossible full-data verification or flawlessness. Minor caveats can still
+be compatible with 5 if they do not materially weaken the criterion.
 
 1. data_fidelity - visible values, totals, trends, and encodings are internally
    consistent and answer the task.
    1 fabricated/contradictory or no visual data; 2 major mismatch or broken
-   marks; 3 mostly plausible but weak spot-checks/disclosure; 4 faithful with
-   visible spot-checks passing; 5 fully faithful including aggregations, units,
-   edge cases, and caveats.
+   marks; 3 mostly plausible but weak support/disclosure; 4 strong with a
+   material unresolved concern; 5 all visible claims, values, encodings, units,
+   and disclosed transformations appear faithful and well-supported.
 
 2. insightfulness - the artifact helps a reader learn something beyond raw
    plotting.
@@ -74,19 +77,19 @@ Rate each criterion 1-5 using these anchors. Use exact ids:
 
 3. narrative_coherence - the story arc and internal consistency.
    1 contradictory/no story; 2 disconnected panels; 3 mostly coherent with an
-   implicit takeaway; 4 clear sections and consistent encodings; 5 tight
-   hook-build-payoff arc where every panel earns its place.
+   implicit takeaway; 4 clear sections with a material gap; 5 tight
+   hook-build-payoff arc with consistent encodings and purposeful panels.
 
 4. visual_craft - chart choice, encoding, layout, labels, legends, axes,
    legibility, accessibility, and disclosure of scope/filters/time/aggregation.
    1 illegible/misrepresenting/broken; 2 major label or chart-choice problems;
-   3 readable but basic; 4 well-matched and clearly labelled; 5 polished,
-   accessible, and comprehensively disclosed.
+   3 readable but basic; 4 well-matched with a material limitation; 5 polished,
+   accessible, legible, and well-disclosed.
 
 5. functionality - working interaction that aids analysis.
    1 broken or unusable; 2 controls mostly dead/confusing; 3 core interactions
-   work; 4 all tested controls work as implied; 5 interactions meaningfully
-   deepen the analysis and all tested states render cleanly.
+   work; 4 tested interactions work but add limited value or leave a material
+   concern; 5 meaningful analytic interactions work and deepen the analysis.
 
 Evidence requirements:
 - Cite observation ids such as obs_1 / obs_2 in every criterion.
@@ -260,25 +263,25 @@ def run_evaluation(workdir: Path, artifact_url: str) -> dict[str, Any]:
     result = _compute_score(result, ctx)
     screenshots = sorted(str(p) for p in ctx.artifacts_dir.glob("eval_*.jpg"))
     result.setdefault("browser", {}).update({
-        "tool": "playwright+vision",
+        "tool": "playwright",
         "entrypoint_url": artifact_url,
         "viewports": [{"width": 1440, "height": 900}],
-        "observations": ctx.observations,
-        "actions": ctx.actions,
+        # "observations": ctx.observations,
+        # "actions": ctx.actions,
     })
     result.setdefault("artifacts", {}).update({"screenshots": screenshots})
     meta = result.setdefault("metadata", {})
-    meta["evaluator"] = meta.get("evaluator") or "vision-evaluator-v2"
+    meta["evaluator"] = meta.get("evaluator") or "evaluator-v2"
     meta["tokens"] = usage
     meta["steps"] = assistant_steps
-    meta["tool_counts"] = tool_counts
+    # meta["tool_counts"] = tool_counts
     meta["finished"] = finished
-    meta["finish_rejections"] = finish_rejections
-    meta["model_errors"] = model_errors
-    meta["image_send_failures"] = image_send_failures
-    meta["message_trace"] = str(workdir / "messages_evaluate.json")
-    meta["message_trace_written"] = (workdir / "messages_evaluate.json").exists()
-    meta["messages"] = _messages_for_trace(messages)
+    # meta["finish_rejections"] = finish_rejections
+    # meta["model_errors"] = model_errors
+    # meta["image_send_failures"] = image_send_failures
+    # meta["message_trace"] = str(workdir / "messages_evaluate.json")
+    # meta["message_trace_written"] = (workdir / "messages_evaluate.json").exists()
+    # meta["messages"] = _messages_for_trace(messages)
 
     tc_str = " ".join(f"{k}={v}" for k, v in sorted(tool_counts.items())) if tool_counts else "-"
     print(
