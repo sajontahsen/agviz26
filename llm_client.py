@@ -38,6 +38,7 @@ class OpenAIChatClient:
         self.client = OpenAI()
         # Populated after each create() so callers can meter token spend.
         self.last_usage: dict[str, Any] = {}
+        self.remaining_tokens: int | None = None
 
     def create(
         self,
@@ -76,6 +77,7 @@ class ArenaChatClient:
         )
         # Populated after each create() so callers can meter token spend.
         self.last_usage: dict[str, Any] = {}
+        self.remaining_tokens: int | None = None
 
     def create(
         self,
@@ -96,6 +98,7 @@ class ArenaChatClient:
             max_tokens=max_tokens,
         )
         self.last_usage = _usage_dict(getattr(response, "usage", None))
+        self.remaining_tokens = getattr(response, "remaining_submission_tokens", None)
         return response.message
 
 
