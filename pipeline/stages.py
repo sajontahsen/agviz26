@@ -15,7 +15,7 @@ from .runner import BudgetTracker, StageResult, run_stage
 from .tools import ToolContext
 
 # Cap generation so the shared per-job budget (~1M cloud) leaves room for evaluation.
-GEN_TOKEN_CEILING = 800_000
+GEN_TOKEN_CEILING = 700_000
 ANALYSIS_TOKEN_CEILING = 300_000
 
 
@@ -161,7 +161,6 @@ Narrative and insight requirements:
 - Answers must be supported by visual evidence, not prose or text alone.  
 
 Visual craft and functionality requirements:
-- Follow data visualization standards and best practices.
 - Choose chart types based on the output data grain and task: line/area for
   time trends, ranked bars for top categories, scatter/small multiples for
   comparisons, compact tables for sparse evidence, and summarized networks for
@@ -191,13 +190,13 @@ You are judged on these:
 - functionality: interactions (filters, tooltips, selection) actually work.
 - visual_craft: right chart types, clear titles/axes/labels, disclosed filters/timeframes/scope, readable color.
 - insightfulness: call out trends, exceptions, comparisons — not just raw charts.
-- narrative_coherence: a hook -> build -> payoff arc; consistent encodings across panels.
+- narrative_coherence: an explicit hook -> build -> payoff arc; consistent encodings across panels.
 - data_fidelity: numbers on screen match the actual data.
 
 Validation Loop:
 When the page is written, you MUST call the verify tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
 If verify reports any errors/discrepancy:
-1. Use str_replace or rewrite to fix the bug in build.py/HTML.
+1. Use str_replace or apply_patch to fix the bug in build.py/HTML.
 2. Re-run build.py via bash to generate the new dist/index.html.
 3. Call verify again.
 

@@ -104,7 +104,7 @@ Call finish with:
   "criteria": [
     {"id": "<criterion_id>", "score": <1-5>, "max_score": 5, "anchor": "<matched level>", "evidence": ["obs_1: ...", "obs_2: ..."]}
   ],
-  "metadata": {"evaluator": "vision-evaluator-v2"}
+  "metadata": {"evaluator": "evaluator-v2"}
 }"""
 
 
@@ -357,7 +357,7 @@ def _fallback_result(ctx: EvalContext, reason: str = "insufficient completed eva
             {"id": cid, "score": score, "max_score": 5, "anchor": "fallback conservative score", "evidence": [f"fallback: {reason}"]}
             for cid in REQUIRED_CRITERIA
         ],
-        "metadata": {"evaluator": "vision-evaluator-v2", "fallback": True, "fallback_reason": reason},
+        "metadata": {"evaluator": "evaluator-v2", "fallback": True, "fallback_reason": reason},
     }
 
 
