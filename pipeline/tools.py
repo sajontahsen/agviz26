@@ -233,6 +233,104 @@ _CONTROLS_JS = """() => {
     return {total: els.length, breakdown: counts};
 }"""
 
+_AXIS_HEALTH_JS = """() => {
+    const plots = [...document.querySelectorAll('.js-plotly-plot')];
+    const parseNum = (raw) => {
+        const s = String(raw || '').trim()
+            .replace(/,/g, '')
+            .replace(/%$/, '')
+            .replace(/[−–—]/g, '-');
+        if (!/^[-+]?\\d*\\.?\\d+(e[-+]?\\d+)?$/i.test(s)) return null;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+    };
+    const monotonic = (vals) => {
+        if (vals.length < 4) return true;
+        let inc = true, dec = true;
+        for (let i = 1; i < vals.length; i++) {
+            if (vals[i] < vals[i - 1]) inc = false;
+            if (vals[i] > vals[i - 1]) dec = false;
+        }
+        return inc || dec;
+    };
+    const numericShareOf = (vals) => {
+        const flat = vals.flatMap(v => Array.isArray(v) ? v : [v]).filter(v => v !== null && v !== undefined && v !== '');
+        if (!flat.length) return 0;
+        return flat.filter(v => typeof v === 'number' || parseNum(v) !== null).length / flat.length;
+    };
+    const rect = (el) => {
+        const r = el.getBoundingClientRect();
+        return {x: r.x, y: r.y, w: r.width, h: r.height};
+    };
+    const overlaps = (a, b) => (
+        a.x < b.x + b.w && a.x + a.w > b.x &&
+        a.y < b.y + b.h && a.y + a.h > b.y
+    );
+    const detail = [];
+    for (const plot of plots) {
+        const layout = plot._fullLayout || plot.layout || {};
+        const plotId = plot.id || '(anon)';
+        const axisKeys = Object.keys(layout).filter(k => /^yaxis\\d*$/.test(k));
+        for (const axisKey of axisKeys.length ? axisKeys : ['yaxis']) {
+            const axis = layout[axisKey] || {};
+            const axisRef = axisKey === 'yaxis' ? 'y' : 'y' + axisKey.slice('yaxis'.length);
+            const traceY = (plot.data || [])
+                .filter(t => (t.yaxis || 'y') === axisRef)
+                .map(t => t.y || []);
+            const dataNumericShare = numericShareOf(traceY);
+            const issues = [];
+            if ((axis.type === 'category' || axis.type === 'multicategory') && dataNumericShare >= 0.8) {
+                issues.push(`axis resolved as ${axis.type} even though trace y-data is mostly numeric`);
+            }
+            if (axis.type === 'category' || axis.type === 'multicategory') {
+                if (issues.length) {
+                    detail.push({
+                        plot: plotId,
+                        axis: axisKey,
+                        type: axis.type || 'auto',
+                        labels: [],
+                        issues,
+                    });
+                }
+                continue;
+            }
+            const suffix = axisKey === 'yaxis' ? '' : axisKey.slice('yaxis'.length);
+            const tickClass = suffix ? `.y${suffix}tick text` : '.ytick text';
+            const els = [...plot.querySelectorAll(tickClass)].filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+            const labels = els.map(el => el.textContent.trim()).filter(Boolean);
+            const nums = labels.map(parseNum).filter(v => v !== null);
+            const numericShare = labels.length ? nums.length / labels.length : 0;
+            if (labels.length >= 4 && numericShare >= 0.7 && !monotonic(nums)) {
+                issues.push('numeric tick labels are non-monotonic');
+            }
+            let overlapCount = 0;
+            const boxes = els.map(rect);
+            for (let i = 0; i < boxes.length; i++) {
+                for (let j = i + 1; j < boxes.length; j++) {
+                    if (overlaps(boxes[i], boxes[j])) overlapCount++;
+                }
+            }
+            if (overlapCount > 0) issues.push(`${overlapCount} tick-label overlaps`);
+            if (issues.length) {
+                detail.push({
+                    plot: plotId,
+                    axis: axisKey,
+                    type: axis.type || 'auto',
+                    labels: labels.slice(0, 16),
+                    issues,
+                });
+            }
+        }
+    }
+    return {
+        checked_plots: plots.length,
+        issues: detail,
+    };
+}"""
+
 # Page prose only — inner_text('body') scrapes every SVG axis tick label too.
 _BODY_TEXT_JS = """() => {
     const skip = new Set(['SVG', 'SCRIPT', 'STYLE', 'NOSCRIPT']);
@@ -268,6 +366,7 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
             title = page.title()
             text = page.evaluate(_BODY_TEXT_JS)[:1500]
             charts = page.evaluate(_CHART_HEALTH_JS)
+            axes = page.evaluate(_AXIS_HEALTH_JS)
             controls = page.evaluate(_CONTROLS_JS)
             for act in actions:
                 action_log.append(_run_action(page, act))
@@ -291,6 +390,17 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
         parts.append(f"  EMPTY (no data points): {', '.join(charts['no_points'])}")
     if charts["zero_size"]:
         parts.append(f"  ZERO-SIZE (not visible): {', '.join(charts['zero_size'])}")
+    if axes["issues"]:
+        parts.append(f"axis_warnings ({len(axes['issues'])}):")
+        for issue in axes["issues"][:12]:
+            labels = ", ".join(issue.get("labels") or [])
+            problems = "; ".join(issue.get("issues") or [])
+            parts.append(
+                f"  {issue.get('plot')} {issue.get('axis')} ({issue.get('type')}): "
+                f"{problems}; labels=[{labels}]"
+            )
+    else:
+        parts.append(f"axis_warnings (0): none across {axes['checked_plots']} Plotly plots")
     parts += [
         f"controls ({controls['total']}): {ctrl_str}",
         f"screenshot: {shot}",
@@ -597,9 +707,9 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "verify": _fn(
         "verify",
-        "Render an artifact with a headless browser and return a compact health summary (console errors, title, "
-        "text sample, screenshot) plus results of optional interaction probes. With no 'url', serves dist/ locally. "
-        "You MUST call this before finishing a build.",
+        "Render an artifact with a headless browser and return a compact health summary (console errors, chart health, "
+        "numeric-axis warnings, title, text sample, screenshot) plus results of optional interaction probes. With no "
+        "'url', serves dist/ locally. You MUST call this before finishing a build.",
         {
             "url": {"type": "string", "description": "Artifact URL; omit to serve the local dist/ folder."},
             "actions": {

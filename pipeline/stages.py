@@ -55,7 +55,7 @@ Your job is
 Workflow:
 1. read_file task.md, every documentation file mentioned, and list data/ to see the files and their formats.
 2. Inspect small data samples/headers/schemas. Do not dump full datasets into your reasoning. Instead use `.info()`, `.head(5)`, or print dict/graph samples. If you need a overall profile of the data, write a Python script and let IT compute the profile.
-3. Decompose the task into the analytical questions whose answers will drive an insightful, well-structured visualization.
+3. Decompose the task into analytical questions whose answers will drive an insightful, well-structured visualization. Make sure every required task part has at least one planned question/view.
 4. Write source/analyze.py that computes the answers to the questions. It must:
    - load raw data once where practical;
    - create outputs/ if needed;
@@ -66,7 +66,8 @@ Workflow:
    - include generated schema, sample rows/items, caveats, assumptions, and file paths.
 5. Run source/analyze.py with bash.
 6. If a view fails twice, simplify or drop that view. Preserve the working views.
-7. Finish only after analysis_skeleton.json exists and references real output files.
+7. Re-read analysis_skeleton.json and audit task coverage against task.md. If any core requirement is missing, add a view before finishing. 
+8. Finish only after analysis_skeleton.json exists and references real output files.
 
 Skeleton shape:
 {
@@ -168,6 +169,9 @@ Visual craft and functionality requirements:
 - Use exact field names from answer_data.schema/sample/output files. Do not
   invent renamed keys. Be defensive about nulls and about samples represented
   as arrays rather than objects.
+- When loading CSV/JSON outputs in build.py, convert fields to the 
+  types declared in analysis_skeleton.answer_data.schema before passing them 
+  to Plotly or using them in calculations.
 - Implement a number of meaningful controls yourself with vanilla JS
   when they help the story: tabs, filters, search, toggles, or linked
   highlighting. Do not rely purely on Plotly defaults for interactivity.
@@ -195,7 +199,7 @@ You are judged on these:
 
 Validation Loop:
 When the page is written, you MUST call the verify tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
-If verify reports any errors/discrepancy:
+If verify reports any errors, empty charts, zero-size charts, numeric-axis warnings, or discrepancy:
 1. Use str_replace or apply_patch to fix the bug in build.py/HTML.
 2. Re-run build.py via bash to generate the new dist/index.html.
 3. Call verify again.
