@@ -4,6 +4,7 @@ Executors return an error string rather than raising, so one bad call never cras
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shlex
@@ -50,6 +51,16 @@ class ToolContext:
 # ---------------------------------------------------------------------------
 
 _MAX_OUTPUT = 12000  # hard clip on any single tool result fed back to the model
+_MAX_IMAGE_B64_CHARS = 6_800_000
+_MAX_VISION_DIMENSION = 7_800
+_VISION_VIEWPORT_WIDTH = 1280
+_VISION_VIEWPORT_HEIGHT = 900
+_VISION_SLICE_HEIGHT = 1500
+_VISION_OVERLAP = 150
+_VISION_MAX_IMAGES = 5
+_VISION_JPEG_QUALITY = 72
+
+ToolContent = str | list[dict[str, Any]]
 
 
 def _clip(text: str, limit: int = _MAX_OUTPUT) -> str:
@@ -195,6 +206,24 @@ def verify(args: dict[str, Any], ctx: ToolContext) -> str:
 
     with _maybe_serve(url, ctx.tool_root / "dist") as resolved_url:
         return _clip(_playwright_probe(resolved_url, actions, shot))
+
+
+def vision_check(args: dict[str, Any], ctx: ToolContext) -> ToolContent:
+    """Return a bounded visual sanity check as text plus page-slice screenshots."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except Exception as exc:  # pragma: no cover - env dependent
+        return f"vision_check unavailable: Playwright not importable ({exc}). Skipping visual sanity check."
+
+    dist = ctx.tool_root / "dist" / "index.html"
+    if not dist.exists():
+        return "vision_check error: dist/index.html does not exist. Build the artifact and run verify first."
+
+    ctx.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    ctx._verify_count += 1
+
+    with _maybe_serve(None, ctx.tool_root / "dist") as resolved_url:
+        return _capture_vision_slices(resolved_url, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +378,14 @@ _BODY_TEXT_JS = """() => {
     return out.join('\\n');
 }"""
 
+_PAGE_HEIGHT_JS = """() => Math.ceil(Math.max(
+    document.body ? document.body.scrollHeight : 0,
+    document.documentElement ? document.documentElement.scrollHeight : 0,
+    document.body ? document.body.offsetHeight : 0,
+    document.documentElement ? document.documentElement.offsetHeight : 0,
+    document.documentElement ? document.documentElement.clientHeight : 0
+))"""
+
 
 def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> str:
     from playwright.sync_api import sync_playwright
@@ -359,7 +396,7 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()
-            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            page = browser.new_page(viewport={"width": _VISION_VIEWPORT_WIDTH, "height": _VISION_VIEWPORT_HEIGHT})
             page.on("console", lambda m: console_errors.append(f"{m.type}: {m.text}") if m.type == "error" else None)
             page.on("pageerror", lambda e: page_errors.append(str(e)))
             page.goto(url, wait_until="networkidle", timeout=45000)
@@ -379,6 +416,7 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
     chart_str = " ".join(f"{p['id']}(t={p['traces']},pts={p['points']},{p['w']}x{p['h']})" for p in charts["detail"])
     parts = [
         f"url: {url}",
+        f"viewport: {_VISION_VIEWPORT_WIDTH}x{_VISION_VIEWPORT_HEIGHT}",
         f"title: {title!r}",
         f"console_errors ({len(console_errors)}): " + ("; ".join(console_errors[:10]) or "none"),
         f"page_errors ({len(page_errors)}): " + ("; ".join(page_errors[:10]) or "none"),
@@ -409,6 +447,134 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
         parts.append("actions:\n  " + "\n  ".join(action_log))
     parts.append(f"body_text_sample:\n{text}")
     return "\n".join(parts)
+
+
+def _capture_vision_slices(url: str, ctx: ToolContext) -> ToolContent:
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": _VISION_VIEWPORT_WIDTH, "height": _VISION_VIEWPORT_HEIGHT})
+            page.goto(url, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(1200)
+            page_height = max(_VISION_VIEWPORT_HEIGHT, int(page.evaluate(_PAGE_HEIGHT_JS) or _VISION_VIEWPORT_HEIGHT))
+            plan = _vision_slice_plan(page_height)
+            selected = plan["selected"]
+            content: list[dict[str, Any]] = [_vision_intro_text(
+                url=url,
+                page_height=page_height,
+                total_needed=len(plan["all"]),
+                selected_count=len(selected),
+                sampled=plan["sampled"],
+            )]
+
+            for idx, segment in enumerate(selected, 1):
+                shot = ctx.artifacts_dir / f"vision_check_{ctx._verify_count}_{idx}.jpg"
+                _capture_vision_slice(page, shot, segment["y"], segment["height"])
+                content.append({"type": "text", "text": _vision_slice_label(idx, len(selected), segment, plan["sampled"])})
+                content.extend(_image_parts(shot))
+            browser.close()
+            return content
+    except Exception as exc:
+        return f"vision_check error while rendering {url}: {exc}"
+
+
+def _vision_intro_text(
+    *,
+    url: str,
+    page_height: int,
+    total_needed: int,
+    selected_count: int,
+    sampled: bool,
+) -> dict[str, str]:
+    gap_note = (
+        "Coverage: sampled because the page needs more than 5 vertical chunks; unobserved vertical gaps exist between some returned slices."
+        if sampled
+        else "Coverage: exhaustive; adjacent slices overlap vertically."
+    )
+    text = "\n".join([
+        "VISION_CHECK screenshots.",
+        f"url: {url}",
+        f"viewport: {_VISION_VIEWPORT_WIDTH}x{_VISION_VIEWPORT_HEIGHT}; slice_height: {_VISION_SLICE_HEIGHT}; overlap: {_VISION_OVERLAP}; max_images: {_VISION_MAX_IMAGES}",
+        f"page_height_px: {page_height}; mechanical_chunks_needed: {total_needed}; returned_slices: {selected_count}; sampled: {sampled}",
+        gap_note,
+        "The following labeled slices are ordered top-to-bottom.",
+    ])
+    return {"type": "text", "text": _clip(text)}
+
+
+def _vision_slice_plan(page_height: int) -> dict[str, Any]:
+    slice_height = min(_VISION_SLICE_HEIGHT, _MAX_VISION_DIMENSION)
+    overlap = min(_VISION_OVERLAP, slice_height - 1)
+    step = slice_height - overlap
+    max_y = max(0, page_height - slice_height)
+    positions: list[int] = [0]
+    while positions[-1] < max_y:
+        next_y = positions[-1] + step
+        if page_height - (next_y + slice_height) <= overlap:
+            next_y = max_y
+        if next_y <= positions[-1]:
+            break
+        positions.append(next_y)
+    segments = [{"y": y, "height": min(slice_height, page_height - y)} for y in sorted(set(positions))]
+    if len(segments) <= _VISION_MAX_IMAGES:
+        return {"all": segments, "selected": segments, "sampled": False}
+    indices = _sample_indices(len(segments), _VISION_MAX_IMAGES)
+    return {"all": segments, "selected": [segments[i] for i in indices], "sampled": True}
+
+
+def _sample_indices(total: int, count: int) -> list[int]:
+    if count >= total:
+        return list(range(total))
+    indices = {0, total - 1}
+    if count > 2:
+        for i in range(1, count - 1):
+            indices.add(round(i * (total - 1) / (count - 1)))
+    out = sorted(indices)
+    cursor = 0
+    while len(out) < count and cursor < total:
+        if cursor not in out:
+            out.append(cursor)
+        cursor += 1
+    return sorted(out[:count])
+
+
+def _capture_vision_slice(page: Any, path: Path, y: int, height: int) -> None:
+    width = min(_VISION_VIEWPORT_WIDTH, _MAX_VISION_DIMENSION)
+    height = max(1, min(height, _MAX_VISION_DIMENSION))
+    page.screenshot(
+        path=str(path),
+        type="jpeg",
+        quality=_VISION_JPEG_QUALITY,
+        clip={"x": 0, "y": y, "width": width, "height": height},
+    )
+
+
+def _vision_slice_label(index: int, total: int, segment: dict[str, int], sampled: bool) -> str:
+    y = segment["y"]
+    h = segment["height"]
+    lines = [
+        f"VISION_CHECK SLICE {index} OF {total}: vertical range y={y}..{y + h}px.",
+    ]
+    if sampled:
+        lines.append("Sampling note: some vertical ranges between returned slices are not shown.")
+    return "\n".join(lines)
+
+
+def _image_parts(path: Path) -> list[dict[str, Any]]:
+    data_url = _image_data_url(path)
+    if len(data_url) > _MAX_IMAGE_B64_CHARS:
+        return [{
+            "type": "text",
+            "text": f"[screenshot image omitted because it is too large for the vision API: {path}]",
+        }]
+    return [{"type": "image_url", "image_url": {"url": data_url}}]
+
+
+def _image_data_url(path: Path) -> str:
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{data}"
 
 
 def _run_action(page: Any, act: dict[str, Any]) -> str:
@@ -627,7 +793,7 @@ def _which(name: str) -> str | None:
 # Tool registry — schema + executor, selectable per stage by name
 # ---------------------------------------------------------------------------
 
-Executor = Callable[[dict[str, Any], ToolContext], str]
+Executor = Callable[[dict[str, Any], ToolContext], ToolContent]
 
 
 def _fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -721,6 +887,13 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         [],
     ),
+    "vision_check": _fn(
+        "vision_check",
+        "Capture labeled top-to-bottom screenshots of dist/index.html at 1280px width. Uses 1500px vertical "
+        "slices with 150px overlap, capped at 5 images; long pages are sampled and marked with gap notes.",
+        {},
+        [],
+    ),
 }
 
 
@@ -732,6 +905,7 @@ EXECUTORS: dict[str, Executor] = {
     "search": search,
     "bash": bash,
     "verify": verify,
+    "vision_check": vision_check,
 }
 
 

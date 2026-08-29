@@ -182,7 +182,7 @@ def run_stage(
         root = getattr(ctx, "tool_root", None) or getattr(ctx, "workdir", None)
         if root:
             try:
-                (Path(root) / f"messages_{name}.json").write_text(json.dumps(messages, indent=2), encoding="utf-8")
+                (Path(root) / f"messages_{name}.json").write_text(json.dumps(_messages_for_trace(messages), indent=2), encoding="utf-8")
             except Exception as exc:
                 _log(name, f"failed to write messages: {exc}")
 
@@ -191,7 +191,7 @@ def run_stage(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _tool_msg(call: dict[str, Any], content: str) -> dict[str, Any]:
+def _tool_msg(call: dict[str, Any], content: Any) -> dict[str, Any]:
     return {"role": "tool", "tool_call_id": call.get("id"), "content": content}
 
 
@@ -218,7 +218,9 @@ def _compact(messages: list[dict[str, Any]], prune_keep: int) -> list[dict[str, 
         role = msg.get("role")
         if role == "tool":
             content = msg.get("content") or ""
-            if len(content) > _STALE_PREVIEW:
+            if isinstance(content, list):
+                compacted.append({**msg, "content": _strip_image_parts(content)})
+            elif len(content) > _STALE_PREVIEW:
                 compacted.append({**msg, "content": content[:_STALE_PREVIEW] + f"\n... [{len(content)} chars, trimmed]"})
             else:
                 compacted.append(msg)
@@ -258,6 +260,54 @@ def _shrink_args(raw: str) -> tuple[str, bool]:
             args[k] = v[:_STALE_PREVIEW] + f"... [{len(v)} chars, trimmed]"
             changed = True
     return (json.dumps(args), True) if changed else (raw, False)
+
+
+def _messages_for_trace(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_message_for_trace(msg) for msg in messages]
+
+
+def _message_for_trace(msg: dict[str, Any]) -> dict[str, Any]:
+    out = dict(msg)
+    if "content" in out:
+        out["content"] = _content_for_trace(out["content"])
+    if out.get("tool_calls"):
+        out["tool_calls"] = [_tool_call_for_trace(call) for call in out.get("tool_calls") or []]
+    return out
+
+
+def _content_for_trace(content: Any) -> Any:
+    if isinstance(content, list):
+        return _strip_image_parts(content)
+    if isinstance(content, str) and len(content) > 4000:
+        return content[:3900] + f"\n... [{len(content) - 3900} chars trimmed]"
+    return content
+
+
+def _tool_call_for_trace(call: dict[str, Any]) -> dict[str, Any]:
+    out = dict(call)
+    function = dict(out.get("function") or {})
+    raw = function.get("arguments")
+    if isinstance(raw, str) and len(raw) > 4000:
+        function["arguments"] = raw[:3900] + f"\n... [{len(raw) - 3900} chars trimmed]"
+    out["function"] = function
+    return out
+
+
+def _strip_image_parts(content: list[dict[str, Any]]) -> list[dict[str, str]]:
+    parts: list[dict[str, str]] = []
+    for part in content:
+        if _is_image_part(part):
+            parts.append({"type": "text", "text": "[screenshot image omitted from saved/compacted context]"})
+            continue
+        text = str(part.get("text") if isinstance(part, dict) else part)
+        if len(text) > 4000:
+            text = text[:3900] + f"\n... [{len(text) - 3900} chars trimmed]"
+        parts.append({"type": "text", "text": text})
+    return parts
+
+
+def _is_image_part(part: Any) -> bool:
+    return isinstance(part, dict) and part.get("type") in {"image_url", "image"}
 
 
 def _log(stage: str, msg: str) -> None:
