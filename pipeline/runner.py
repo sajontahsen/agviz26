@@ -83,9 +83,12 @@ def run_stage(
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     tool_counts: dict[str, int] = {}
     model_errors: list[str] = []
+    non_image_model_errors = 0
     idle_nudges = 0
     warned_budget = False
     warned_steps = False
+    fresh_image_tool_ids: set[str] = set()
+    image_send_failures = 0
 
     try:
         for step in range(1, max_steps + 1):
@@ -111,10 +114,12 @@ def run_stage(
                         "Finalize the working parts and ship now."
                     )})
     
+            request_messages = _compact(messages, prune_keep, keep_image_tool_ids=fresh_image_tool_ids)
+            request_had_images = _messages_have_images(request_messages)
             try:
                 message = client.create(
                     model=model,
-                    messages=_compact(messages, prune_keep),
+                    messages=request_messages,
                     tools=tools,
                     tool_choice="auto",
                     max_tokens=max_tokens,
@@ -122,8 +127,28 @@ def run_stage(
             except Exception as exc:  # noqa: BLE001 - let stages recover from transient/provider failures
                 error_text = _short_error(exc)
                 model_errors.append(error_text)
-                _log(name, f"model request error {len(model_errors)}/{_MAX_MODEL_ERRORS}: {error_text}")
-                if len(model_errors) >= _MAX_MODEL_ERRORS:
+                if request_had_images:
+                    image_send_failures += 1
+                    messages = _strip_all_message_images(messages, reason="stale or failed vision_check image omitted")
+                    fresh_image_tool_ids.clear()
+                    _log(name, f"model request error while sending images {image_send_failures}: {error_text}")
+                    if image_send_failures >= 2:
+                        messages.append({"role": "user", "content": (
+                            "MODEL REQUEST ERROR: sending vision_check images failed again: "
+                            f"{error_text}\nImages have been removed from context. Continue from verify output, "
+                            "and text-only overage notes. Do not call vision_check again; "
+                            "make fixes as necessary and finalize the working artifact."
+                        )})
+                    else:
+                        messages.append({"role": "user", "content": (
+                            "MODEL REQUEST ERROR: the previous request failed while sending vision_check images: "
+                            f"{error_text}\nThe image payloads have been removed from context. Continue using the "
+                            "text coverage notes and prior verify output; call finish if the artifact is ready."
+                        )})
+                    continue
+                non_image_model_errors += 1
+                _log(name, f"model request error {non_image_model_errors}/{_MAX_MODEL_ERRORS}: {error_text}")
+                if non_image_model_errors >= _MAX_MODEL_ERRORS:
                     return StageResult(
                         name,
                         {"error": "repeated model request failures", "model_errors": model_errors},
@@ -139,6 +164,9 @@ def run_stage(
                     "If the stage has enough working output, call finish with a short JSON summary."
                 )})
                 continue
+            if request_had_images:
+                messages = _strip_all_message_images(messages, reason="stale vision_check image omitted after use")
+                fresh_image_tool_ids.clear()
             _accumulate(usage, getattr(client, "last_usage", {}))
             if budget is not None:
                 budget.add(getattr(client, "last_usage", {}))
@@ -174,6 +202,11 @@ def run_stage(
                     output = executor(args, ctx) if executor else f"Unknown tool: {fname}"
                 except Exception as exc:  # noqa: BLE001 - tool failures should be recoverable by the model
                     output = f"{fname or 'tool'} error: {_short_error(exc)}"
+                if _content_has_images(output):
+                    if image_send_failures >= 2:
+                        output = _strip_image_parts(output, reason="vision_check image omitted after repeated image-send failures")
+                    else:
+                        fresh_image_tool_ids.add(str(call.get("id") or ""))
                 messages.append(_tool_msg(call, output))
     
         _log(name, f"hit max_steps={max_steps} without finish; tokens={usage['total_tokens']} tools={tool_counts}")
@@ -204,27 +237,30 @@ def _short_error(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0][:500] or exc.__class__.__name__
 
 
-def _compact(messages: list[dict[str, Any]], prune_keep: int) -> list[dict[str, Any]]:
+def _compact(
+    messages: list[dict[str, Any]],
+    prune_keep: int,
+    keep_image_tool_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Return a compacted copy for sending to the LLM."""
-    if len(messages) <= prune_keep + 2:
-        return messages
+    keep_image_tool_ids = keep_image_tool_ids or set()
     tail_start = len(messages) - prune_keep
     compacted: list[dict[str, Any]] = list(messages[:2])
     for i in range(2, len(messages)):
         msg = messages[i]
-        if i >= tail_start:
-            compacted.append(msg)
-            continue
         role = msg.get("role")
         if role == "tool":
             content = msg.get("content") or ""
             if isinstance(content, list):
-                compacted.append({**msg, "content": _strip_image_parts(content)})
-            elif len(content) > _STALE_PREVIEW:
+                if str(msg.get("tool_call_id") or "") in keep_image_tool_ids:
+                    compacted.append(msg)
+                else:
+                    compacted.append({**msg, "content": _strip_image_parts(content, reason="stale vision_check image omitted")})
+            elif i < tail_start and len(content) > _STALE_PREVIEW:
                 compacted.append({**msg, "content": content[:_STALE_PREVIEW] + f"\n... [{len(content)} chars, trimmed]"})
             else:
                 compacted.append(msg)
-        elif role == "assistant" and msg.get("tool_calls"):
+        elif i < tail_start and role == "assistant" and msg.get("tool_calls"):
             compacted.append(_shrink_assistant(msg))
         else:
             compacted.append(msg)
@@ -277,7 +313,7 @@ def _message_for_trace(msg: dict[str, Any]) -> dict[str, Any]:
 
 def _content_for_trace(content: Any) -> Any:
     if isinstance(content, list):
-        return _strip_image_parts(content)
+        return _strip_image_parts(content, reason="screenshot image omitted from saved trace")
     if isinstance(content, str) and len(content) > 4000:
         return content[:3900] + f"\n... [{len(content) - 3900} chars trimmed]"
     return content
@@ -293,11 +329,20 @@ def _tool_call_for_trace(call: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _strip_image_parts(content: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _strip_all_message_images(messages: list[dict[str, Any]], *, reason: str) -> list[dict[str, Any]]:
+    return [
+        {**msg, "content": _strip_image_parts(msg["content"], reason=reason)}
+        if isinstance(msg.get("content"), list)
+        else msg
+        for msg in messages
+    ]
+
+
+def _strip_image_parts(content: list[dict[str, Any]], *, reason: str) -> list[dict[str, str]]:
     parts: list[dict[str, str]] = []
     for part in content:
         if _is_image_part(part):
-            parts.append({"type": "text", "text": "[screenshot image omitted from saved/compacted context]"})
+            parts.append({"type": "text", "text": f"[{reason}]"})
             continue
         text = str(part.get("text") if isinstance(part, dict) else part)
         if len(text) > 4000:
@@ -308,6 +353,14 @@ def _strip_image_parts(content: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 def _is_image_part(part: Any) -> bool:
     return isinstance(part, dict) and part.get("type") in {"image_url", "image"}
+
+
+def _content_has_images(content: Any) -> bool:
+    return isinstance(content, list) and any(_is_image_part(part) for part in content)
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    return any(_content_has_images(msg.get("content")) for msg in messages)
 
 
 def _log(stage: str, msg: str) -> None:

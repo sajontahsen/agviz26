@@ -471,9 +471,12 @@ def _capture_vision_slices(url: str, ctx: ToolContext) -> ToolContent:
 
             for idx, segment in enumerate(selected, 1):
                 shot = ctx.artifacts_dir / f"vision_check_{ctx._verify_count}_{idx}.jpg"
-                _capture_vision_slice(page, shot, segment["y"], segment["height"])
                 content.append({"type": "text", "text": _vision_slice_label(idx, len(selected), segment, plan["sampled"])})
-                content.extend(_image_parts(shot))
+                try:
+                    _capture_vision_slice(page, shot, segment["y"], segment["height"])
+                    content.extend(_image_parts(shot))
+                except Exception as exc:
+                    content.append({"type": "text", "text": f"[slice capture failed: {_error_reason(exc)}]"})
             browser.close()
             return content
     except Exception as exc:
@@ -496,7 +499,7 @@ def _vision_intro_text(
     text = "\n".join([
         "VISION_CHECK screenshots.",
         f"url: {url}",
-        f"viewport: {_VISION_VIEWPORT_WIDTH}x{_VISION_VIEWPORT_HEIGHT}; slice_height: {_VISION_SLICE_HEIGHT}; overlap: {_VISION_OVERLAP}; max_images: {_VISION_MAX_IMAGES}",
+        f"baseline_viewport: {_VISION_VIEWPORT_WIDTH}x{_VISION_VIEWPORT_HEIGHT}; screenshot_width: {_VISION_VIEWPORT_WIDTH}; slice_height: {_VISION_SLICE_HEIGHT}; overlap: {_VISION_OVERLAP}; max_images: {_VISION_MAX_IMAGES}",
         f"page_height_px: {page_height}; mechanical_chunks_needed: {total_needed}; returned_slices: {selected_count}; sampled: {sampled}",
         gap_note,
         "The following labeled slices are ordered top-to-bottom.",
@@ -547,6 +550,8 @@ def _capture_vision_slice(page: Any, path: Path, y: int, height: int) -> None:
         path=str(path),
         type="jpeg",
         quality=_VISION_JPEG_QUALITY,
+        full_page=True,
+        scale="css",
         clip={"x": 0, "y": y, "width": width, "height": height},
     )
 
@@ -563,6 +568,12 @@ def _vision_slice_label(index: int, total: int, segment: dict[str, int], sampled
 
 
 def _image_parts(path: Path) -> list[dict[str, Any]]:
+    dims = _jpeg_dimensions(path)
+    if dims and (dims[0] > _MAX_VISION_DIMENSION or dims[1] > _MAX_VISION_DIMENSION):
+        return [{
+            "type": "text",
+            "text": f"[screenshot image omitted because dimensions exceed vision API limits: {path} is {dims[0]}x{dims[1]}]",
+        }]
     data_url = _image_data_url(path)
     if len(data_url) > _MAX_IMAGE_B64_CHARS:
         return [{
@@ -575,6 +586,30 @@ def _image_parts(path: Path) -> list[dict[str, Any]]:
 def _image_data_url(path: Path) -> str:
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:image/jpeg;base64,{data}"
+
+
+def _error_reason(exc: Exception) -> str:
+    return str(exc).strip().splitlines()[0][:240] or exc.__class__.__name__
+
+
+def _jpeg_dimensions(path: Path) -> tuple[int, int] | None:
+    data = path.read_bytes()
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            return (int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big"))
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        size = int.from_bytes(data[i + 2:i + 4], "big")
+        if size < 2:
+            return None
+        i += 2 + size
+    return None
 
 
 def _run_action(page: Any, act: dict[str, Any]) -> str:

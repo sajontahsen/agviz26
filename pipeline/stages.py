@@ -319,7 +319,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         user_prompt=coder_user,
         tool_names=["read_file", "write_file", "str_replace", "apply_patch", "bash", "search", "verify", "vision_check"],
         model=pick_model("narrative_coder"),
-        max_steps=70,
+        max_steps=100,
         prune_keep=16,
         budget=budget,
     ))
