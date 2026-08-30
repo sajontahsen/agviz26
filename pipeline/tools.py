@@ -191,10 +191,9 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
     return _clip(_run_bash(command, cwd))
 
 
-def verify(args: dict[str, Any], ctx: ToolContext) -> str:
-    """Render an artifact and return a health summary with automatic chart/control diagnostics."""
-    url = args.get("url")
-    actions = args.get("actions") or []
+def verify(args: dict[str, Any], ctx: ToolContext) -> ToolContent:
+    """Render an artifact and return chart/control diagnostics, optionally with screenshot slices."""
+    include_images = bool(args.get("images", False))
     try:
         from playwright.sync_api import sync_playwright  # noqa: F401
     except Exception as exc:  # pragma: no cover - env dependent
@@ -202,28 +201,18 @@ def verify(args: dict[str, Any], ctx: ToolContext) -> str:
 
     ctx.artifacts_dir.mkdir(parents=True, exist_ok=True)
     ctx._verify_count += 1
-    shot = ctx.artifacts_dir / f"verify_{ctx._verify_count}.png"
-
-    with _maybe_serve(url, ctx.tool_root / "dist") as resolved_url:
-        return _clip(_playwright_probe(resolved_url, actions, shot))
-
-
-def vision_check(args: dict[str, Any], ctx: ToolContext) -> ToolContent:
-    """Return a bounded visual sanity check as text plus page-slice screenshots."""
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
-    except Exception as exc:  # pragma: no cover - env dependent
-        return f"vision_check unavailable: Playwright not importable ({exc}). Skipping visual sanity check."
-
-    dist = ctx.tool_root / "dist" / "index.html"
-    if not dist.exists():
-        return "vision_check error: dist/index.html does not exist. Build the artifact and run verify first."
-
-    ctx.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    ctx._verify_count += 1
 
     with _maybe_serve(None, ctx.tool_root / "dist") as resolved_url:
-        return _capture_vision_slices(resolved_url, ctx)
+        probe = _playwright_probe(resolved_url)
+        if not include_images:
+            return _clip(probe)
+        if probe.startswith("verify error"):
+            return _clip(probe + "\nimages: skipped because the render probe failed.")
+
+        vision = _capture_vision_slices(resolved_url, ctx)
+        if isinstance(vision, str):
+            return _clip(probe + "\n\nimage_capture:\n" + vision)
+        return [{"type": "text", "text": _clip(probe + "\n\nimages: included below as page slices.")}, *vision]
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +376,11 @@ _PAGE_HEIGHT_JS = """() => Math.ceil(Math.max(
 ))"""
 
 
-def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> str:
+def _playwright_probe(url: str) -> str:
     from playwright.sync_api import sync_playwright
 
     console_errors: list[str] = []
     page_errors: list[str] = []
-    action_log: list[str] = []
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()
@@ -405,9 +393,6 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
             charts = page.evaluate(_CHART_HEALTH_JS)
             axes = page.evaluate(_AXIS_HEALTH_JS)
             controls = page.evaluate(_CONTROLS_JS)
-            for act in actions:
-                action_log.append(_run_action(page, act))
-            page.screenshot(path=str(shot), full_page=False)
             browser.close()
     except Exception as exc:
         return f"verify error while rendering {url}: {exc}"
@@ -441,10 +426,7 @@ def _playwright_probe(url: str, actions: list[dict[str, Any]], shot: Path) -> st
         parts.append(f"axis_warnings (0): none across {axes['checked_plots']} Plotly plots")
     parts += [
         f"controls ({controls['total']}): {ctrl_str}",
-        f"screenshot: {shot}",
     ]
-    if action_log:
-        parts.append("actions:\n  " + "\n  ".join(action_log))
     parts.append(f"body_text_sample:\n{text}")
     return "\n".join(parts)
 
@@ -470,7 +452,7 @@ def _capture_vision_slices(url: str, ctx: ToolContext) -> ToolContent:
             )]
 
             for idx, segment in enumerate(selected, 1):
-                shot = ctx.artifacts_dir / f"vision_check_{ctx._verify_count}_{idx}.jpg"
+                shot = ctx.artifacts_dir / f"verify_images_{ctx._verify_count}_{idx}.jpg"
                 content.append({"type": "text", "text": _vision_slice_label(idx, len(selected), segment, plan["sampled"])})
                 try:
                     _capture_vision_slice(page, shot, segment["y"], segment["height"])
@@ -480,7 +462,7 @@ def _capture_vision_slices(url: str, ctx: ToolContext) -> ToolContent:
             browser.close()
             return content
     except Exception as exc:
-        return f"vision_check error while rendering {url}: {exc}"
+        return f"verify image capture error while rendering {url}: {exc}"
 
 
 def _vision_intro_text(
@@ -497,7 +479,7 @@ def _vision_intro_text(
         else "Coverage: exhaustive; adjacent slices overlap vertically."
     )
     text = "\n".join([
-        "VISION_CHECK screenshots.",
+        "VERIFY image slices.",
         f"url: {url}",
         f"baseline_viewport: {_VISION_VIEWPORT_WIDTH}x{_VISION_VIEWPORT_HEIGHT}; screenshot_width: {_VISION_VIEWPORT_WIDTH}; slice_height: {_VISION_SLICE_HEIGHT}; overlap: {_VISION_OVERLAP}; max_images: {_VISION_MAX_IMAGES}",
         f"page_height_px: {page_height}; mechanical_chunks_needed: {total_needed}; returned_slices: {selected_count}; sampled: {sampled}",
@@ -560,7 +542,7 @@ def _vision_slice_label(index: int, total: int, segment: dict[str, int], sampled
     y = segment["y"]
     h = segment["height"]
     lines = [
-        f"VISION_CHECK SLICE {index} OF {total}: vertical range y={y}..{y + h}px.",
+        f"VERIFY IMAGE SLICE {index} OF {total}: vertical range y={y}..{y + h}px.",
     ]
     if sampled:
         lines.append("Sampling note: some vertical ranges between returned slices are not shown.")
@@ -610,31 +592,6 @@ def _jpeg_dimensions(path: Path) -> tuple[int, int] | None:
             return None
         i += 2 + size
     return None
-
-
-def _run_action(page: Any, act: dict[str, Any]) -> str:
-    """Run one small interaction probe; report outcome without throwing."""
-    kind = act.get("do")
-    sel = act.get("selector")
-    try:
-        if kind == "click" and sel:
-            page.click(sel, timeout=5000)
-            return f"click {sel!r}: ok"
-        if kind == "hover" and sel:
-            page.hover(sel, timeout=5000)
-            return f"hover {sel!r}: ok"
-        if kind == "wait":
-            page.wait_for_timeout(int(act.get("ms", 500)))
-            return f"wait {act.get('ms', 500)}ms: ok"
-        if kind == "count" and sel:
-            return f"count {sel!r}: {page.locator(sel).count()}"
-        if kind == "text" and sel:
-            return f"text {sel!r}: {page.locator(sel).first.inner_text()[:200]!r}"
-        return f"unknown action {act!r}"
-    except Exception as exc:
-        # Drop Playwright's retry call log (~1.5k chars) — keep the reason.
-        reason = str(exc).strip().splitlines()[0][:200]
-        return f"{kind} {sel!r}: FAILED ({reason})"
 
 
 @contextmanager
@@ -909,24 +866,11 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "verify": _fn(
         "verify",
         "Render an artifact with a headless browser and return a compact health summary (console errors, chart health, "
-        "numeric-axis warnings, title, text sample, screenshot) plus results of optional interaction probes. With no "
-        "'url', serves dist/ locally. You MUST call this before finishing a build.",
+        "numeric-axis warnings, title, text sample, and control counts). Serves dist/ locally. Set images=true to "
+        "include page screenshots. You MUST call this before finishing a build.",
         {
-            "url": {"type": "string", "description": "Artifact URL; omit to serve the local dist/ folder."},
-            "actions": {
-                "type": "array",
-                "description": "Optional interaction probes, each like {\"do\":\"click\",\"selector\":\"#btn\"}. "
-                "Supported 'do': click, hover, wait(ms), count(selector), text(selector).",
-                "items": {"type": "object"},
-            },
+            "images": {"type": "boolean", "description": "Default false. When true, include rendered page screenshots with the telemetry."},
         },
-        [],
-    ),
-    "vision_check": _fn(
-        "vision_check",
-        "Capture labeled top-to-bottom screenshots of dist/index.html at 1280px width. Uses 1500px vertical "
-        "slices with 150px overlap, capped at 5 images; long pages are sampled and marked with gap notes.",
-        {},
         [],
     ),
 }
@@ -940,7 +884,6 @@ EXECUTORS: dict[str, Executor] = {
     "search": search,
     "bash": bash,
     "verify": verify,
-    "vision_check": vision_check,
 }
 
 

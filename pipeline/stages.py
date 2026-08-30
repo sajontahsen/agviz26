@@ -144,14 +144,7 @@ Workflow:
    You do NOT need to read the data files into your own context; build.py
    reads them.
 5. Run verify, fix, rerun, and verify again until the artifact renders cleanly.
-6. After mechanical verify checks pass, call vision_check once. This is a
-   final visual sanity check, not a redesign pass. Fix only major visible
-   rendering defects: blank charts, clipped or overlapping content, improper
-   labels/axes/legends, severe layout collapse, or obvious visual contradiction
-   between visible prose and charts. Do not redesign, restyle broadly, add new
-   analysis, or chase minor aesthetic preferences.
-7. If you make any changes after vision_check, rerun source/build.py, rerun
-   verify, then call vision_check one more time before finishing.
+
 
 Narrative and insight requirements:
 - The page must feel like an analytical answer, not a chart dump.
@@ -206,14 +199,14 @@ You are judged on these:
 - data_fidelity: numbers on screen match the actual data.
 
 Validation Loop:
-When the page is written, you MUST call the verify tool (with no arguments, to serve dist/ locally). It captures a screenshot and returns a health summary.
-If verify reports any errors, empty charts, zero-size charts, numeric-axis warnings, or discrepancy:
+When the page is written, you MUST call the verify tool (pass {"images": true} argument on the first pass, and later as needed).
+It returns a health summary and, when images=true, page screenshots.
+If you see any errors, empty charts, zero-size charts, numeric-axis warnings, or discrepancy:
 1. Use str_replace or apply_patch to fix the bug in build.py/HTML.
 2. Re-run build.py via bash to generate the new dist/index.html.
 3. Call verify again.
-Iterate until verify passes with 0 errors and working charts. Then use
-vision_check as a last-mile guardrail. Lastly call finish with a short summary of the
-panels."""
+Iterate until verify passes with 0 errors and working charts. 
+Lastly call finish with a short summary of the panels."""
 
 CODER_FALLBACK_SYSTEM = """You are a web data visualization agent.
 
@@ -249,10 +242,7 @@ Build:
 Validation Loop:
 When the page is written, you MUST call the verify tool. If verify reports
 errors, fix source/build.py or the generated HTML, rerun build.py, and verify
-again. After verify passes, call vision_check once as a final visual sanity
-check. Fix only major visible rendering defects, rerun build.py and verify if
-you changed anything, then call finish with a short summary."""
-
+again. Then call finish with a short summary."""
 
 # ---------------------------------------------------------------------------
 # Orchestration
@@ -317,7 +307,7 @@ def orchestrate(workdir: Path) -> dict[str, Any]:
         name="coder",
         system_prompt=coder_system,
         user_prompt=coder_user,
-        tool_names=["read_file", "write_file", "str_replace", "apply_patch", "bash", "search", "verify", "vision_check"],
+        tool_names=["read_file", "write_file", "str_replace", "apply_patch", "bash", "search", "verify"],
         model=pick_model("narrative_coder"),
         max_steps=100,
         prune_keep=16,
